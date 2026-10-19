@@ -1,0 +1,526 @@
+{
+  "schema": "piomo.early-compaction.replay.v1",
+  "date": "2026-10-19",
+  "windowDays": 14,
+  "sessionLimit": 5,
+  "sessionsSelected": 5,
+  "sessionsReplayed": 5,
+  "sessionsSkipped": 0,
+  "sizeModel": {
+    "notesSpanRatio": 0.08,
+    "rewriteFallbackSpanRatio": 0.1,
+    "rewriteMeasure": "median-builtin-recorded-summary-tokens"
+  },
+  "cacheModels": [
+    "token-prefix",
+    "block-level (INFERRED, Anthropic)"
+  ],
+  "sessions": [
+    {
+      "hash": "649ef8033436",
+      "requestCount": 9452,
+      "recordedCompactions": 64,
+      "recordedBuiltinSummaries": 64,
+      "recordedSummaryMedianTokens": 6752,
+      "policies": [
+        {
+          "policy": "stock",
+          "applies": {
+            "cold": 0,
+            "boundary": 0,
+            "threshold": 49
+          },
+          "appliesTotal": 49,
+          "thresholdCrossings": 49,
+          "jobsStarted": 0,
+          "coldMisses": 2,
+          "coldMissTokens": 353093,
+          "applyRereadTokenPrefix": 1553348,
+          "applyRereadBlockLevel": 330848,
+          "prefillTokenPrefix": 15652529,
+          "prefillBlockLevel": 14430029,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 6752,
+          "summaryMaxTokens": 6752,
+          "summaryWriteTokens": 330848,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 55771
+        },
+        {
+          "policy": "early-rewrite",
+          "applies": {
+            "cold": 2,
+            "boundary": 81,
+            "threshold": 3
+          },
+          "appliesTotal": 86,
+          "thresholdCrossings": 3,
+          "jobsStarted": 86,
+          "coldMisses": 1,
+          "coldMissTokens": 51595,
+          "applyRereadTokenPrefix": 2758172,
+          "applyRereadBlockLevel": 580672,
+          "prefillTokenPrefix": 16172814,
+          "prefillBlockLevel": 13995314,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 6752,
+          "summaryMaxTokens": 6752,
+          "summaryWriteTokens": 580672,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 101256
+        },
+        {
+          "policy": "early-notes",
+          "applies": {
+            "cold": 2,
+            "boundary": 85,
+            "threshold": 2
+          },
+          "appliesTotal": 89,
+          "thresholdCrossings": 2,
+          "jobsStarted": 89,
+          "coldMisses": 1,
+          "coldMissTokens": 118671,
+          "applyRereadTokenPrefix": 3599052,
+          "applyRereadBlockLevel": 1049464,
+          "prefillTokenPrefix": 17109801,
+          "prefillBlockLevel": 14560213,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 6752,
+          "summaryMaxTokens": 88308,
+          "summaryWriteTokens": 1049464,
+          "notesAppends": 44,
+          "notesBlocks": 0,
+          "consolidations": 44,
+          "finalContextTokens": 176937
+        }
+      ]
+    },
+    {
+      "hash": "0a8240306866",
+      "requestCount": 8271,
+      "recordedCompactions": 43,
+      "recordedBuiltinSummaries": 13,
+      "recordedSummaryMedianTokens": 4506,
+      "policies": [
+        {
+          "policy": "stock",
+          "applies": {
+            "cold": 0,
+            "boundary": 0,
+            "threshold": 50
+          },
+          "appliesTotal": 50,
+          "thresholdCrossings": 50,
+          "jobsStarted": 0,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 1475300,
+          "applyRereadBlockLevel": 225300,
+          "prefillTokenPrefix": 16775129,
+          "prefillBlockLevel": 15525129,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 4506,
+          "summaryMaxTokens": 4506,
+          "summaryWriteTokens": 225300,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 687672
+        },
+        {
+          "policy": "early-rewrite",
+          "applies": {
+            "cold": 0,
+            "boundary": 88,
+            "threshold": 0
+          },
+          "appliesTotal": 88,
+          "thresholdCrossings": 0,
+          "jobsStarted": 88,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 2621528,
+          "applyRereadBlockLevel": 396528,
+          "prefillTokenPrefix": 17815092,
+          "prefillBlockLevel": 15590092,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 4506,
+          "summaryMaxTokens": 4506,
+          "summaryWriteTokens": 396528,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 276020
+        },
+        {
+          "policy": "early-notes",
+          "applies": {
+            "cold": 0,
+            "boundary": 91,
+            "threshold": 0
+          },
+          "appliesTotal": 91,
+          "thresholdCrossings": 0,
+          "jobsStarted": 91,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 3356359,
+          "applyRereadBlockLevel": 848589,
+          "prefillTokenPrefix": 18519815,
+          "prefillBlockLevel": 16012045,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 4506,
+          "summaryMaxTokens": 21510,
+          "summaryWriteTokens": 848589,
+          "notesAppends": 45,
+          "notesBlocks": 0,
+          "consolidations": 45,
+          "finalContextTokens": 356736
+        }
+      ]
+    },
+    {
+      "hash": "d4a88b07e98d",
+      "requestCount": 3644,
+      "recordedCompactions": 24,
+      "recordedBuiltinSummaries": 9,
+      "recordedSummaryMedianTokens": 6793,
+      "policies": [
+        {
+          "policy": "stock",
+          "applies": {
+            "cold": 0,
+            "boundary": 0,
+            "threshold": 32
+          },
+          "appliesTotal": 32,
+          "thresholdCrossings": 32,
+          "jobsStarted": 0,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 1017376,
+          "applyRereadBlockLevel": 217376,
+          "prefillTokenPrefix": 10740975,
+          "prefillBlockLevel": 9940975,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 6793,
+          "summaryMaxTokens": 6793,
+          "summaryWriteTokens": 217376,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 482981
+        },
+        {
+          "policy": "early-rewrite",
+          "applies": {
+            "cold": 0,
+            "boundary": 56,
+            "threshold": 0
+          },
+          "appliesTotal": 56,
+          "thresholdCrossings": 0,
+          "jobsStarted": 56,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 1805408,
+          "applyRereadBlockLevel": 380408,
+          "prefillTokenPrefix": 11388125,
+          "prefillBlockLevel": 9963125,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 6793,
+          "summaryMaxTokens": 6793,
+          "summaryWriteTokens": 380408,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 179530
+        },
+        {
+          "policy": "early-notes",
+          "applies": {
+            "cold": 0,
+            "boundary": 59,
+            "threshold": 0
+          },
+          "appliesTotal": 59,
+          "thresholdCrossings": 0,
+          "jobsStarted": 59,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 2313092,
+          "applyRereadBlockLevel": 616095,
+          "prefillTokenPrefix": 11878766,
+          "prefillBlockLevel": 10181769,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 6793,
+          "summaryMaxTokens": 21781,
+          "summaryWriteTokens": 616095,
+          "notesAppends": 29,
+          "notesBlocks": 0,
+          "consolidations": 29,
+          "finalContextTokens": 100416
+        }
+      ]
+    },
+    {
+      "hash": "2052a6a355d8",
+      "requestCount": 4505,
+      "recordedCompactions": 26,
+      "recordedBuiltinSummaries": 5,
+      "recordedSummaryMedianTokens": 5626,
+      "policies": [
+        {
+          "policy": "stock",
+          "applies": {
+            "cold": 0,
+            "boundary": 0,
+            "threshold": 34
+          },
+          "appliesTotal": 34,
+          "thresholdCrossings": 34,
+          "jobsStarted": 0,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 1066284,
+          "applyRereadBlockLevel": 191284,
+          "prefillTokenPrefix": 11434939,
+          "prefillBlockLevel": 10559939,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 5626,
+          "summaryMaxTokens": 5626,
+          "summaryWriteTokens": 191284,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 105824
+        },
+        {
+          "policy": "early-rewrite",
+          "applies": {
+            "cold": 0,
+            "boundary": 58,
+            "threshold": 0
+          },
+          "appliesTotal": 58,
+          "thresholdCrossings": 0,
+          "jobsStarted": 58,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 1826308,
+          "applyRereadBlockLevel": 326308,
+          "prefillTokenPrefix": 12038931,
+          "prefillBlockLevel": 10538931,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 5626,
+          "summaryMaxTokens": 5626,
+          "summaryWriteTokens": 326308,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 252479
+        },
+        {
+          "policy": "early-notes",
+          "applies": {
+            "cold": 0,
+            "boundary": 61,
+            "threshold": 0
+          },
+          "appliesTotal": 61,
+          "thresholdCrossings": 0,
+          "jobsStarted": 61,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 2359291,
+          "applyRereadBlockLevel": 615511,
+          "prefillTokenPrefix": 12556947,
+          "prefillBlockLevel": 10813167,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 5626,
+          "summaryMaxTokens": 33639,
+          "summaryWriteTokens": 615511,
+          "notesAppends": 30,
+          "notesBlocks": 0,
+          "consolidations": 30,
+          "finalContextTokens": 259620
+        }
+      ]
+    },
+    {
+      "hash": "513996effe65",
+      "requestCount": 4242,
+      "recordedCompactions": 23,
+      "recordedBuiltinSummaries": 8,
+      "recordedSummaryMedianTokens": 7237,
+      "policies": [
+        {
+          "policy": "stock",
+          "applies": {
+            "cold": 0,
+            "boundary": 0,
+            "threshold": 31
+          },
+          "appliesTotal": 31,
+          "thresholdCrossings": 31,
+          "jobsStarted": 0,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 1024347,
+          "applyRereadBlockLevel": 224347,
+          "prefillTokenPrefix": 10337724,
+          "prefillBlockLevel": 9537724,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 7237,
+          "summaryMaxTokens": 7237,
+          "summaryWriteTokens": 224347,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 66249
+        },
+        {
+          "policy": "early-rewrite",
+          "applies": {
+            "cold": 0,
+            "boundary": 54,
+            "threshold": 0
+          },
+          "appliesTotal": 54,
+          "thresholdCrossings": 0,
+          "jobsStarted": 54,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 1765798,
+          "applyRereadBlockLevel": 390798,
+          "prefillTokenPrefix": 10998609,
+          "prefillBlockLevel": 9623609,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 7237,
+          "summaryMaxTokens": 7237,
+          "summaryWriteTokens": 390798,
+          "notesAppends": 0,
+          "notesBlocks": 0,
+          "consolidations": 0,
+          "finalContextTokens": 317361
+        },
+        {
+          "policy": "early-notes",
+          "applies": {
+            "cold": 0,
+            "boundary": 57,
+            "threshold": 0
+          },
+          "appliesTotal": 57,
+          "thresholdCrossings": 0,
+          "jobsStarted": 57,
+          "coldMisses": 0,
+          "coldMissTokens": 0,
+          "applyRereadTokenPrefix": 2261117,
+          "applyRereadBlockLevel": 608481,
+          "prefillTokenPrefix": 11608268,
+          "prefillBlockLevel": 9955632,
+          "summaryStartTokens": 0,
+          "summaryEndTokens": 7237,
+          "summaryMaxTokens": 23015,
+          "summaryWriteTokens": 608481,
+          "notesAppends": 28,
+          "notesBlocks": 0,
+          "consolidations": 28,
+          "finalContextTokens": 325574
+        }
+      ]
+    }
+  ],
+  "skipped": [],
+  "totals": [
+    {
+      "policy": "stock",
+      "applies": {
+        "cold": 0,
+        "boundary": 0,
+        "threshold": 196
+      },
+      "appliesTotal": 196,
+      "thresholdCrossings": 196,
+      "jobsStarted": 0,
+      "coldMisses": 2,
+      "coldMissTokens": 353093,
+      "applyRereadTokenPrefix": 6136655,
+      "applyRereadBlockLevel": 1189155,
+      "prefillTokenPrefix": 64941296,
+      "prefillBlockLevel": 59993796,
+      "summaryStartTokens": 0,
+      "summaryEndTokens": 30914,
+      "summaryMaxTokens": 7237,
+      "summaryWriteTokens": 1189155,
+      "notesAppends": 0,
+      "notesBlocks": 0,
+      "consolidations": 0,
+      "finalContextTokens": 1398497
+    },
+    {
+      "policy": "early-rewrite",
+      "applies": {
+        "cold": 2,
+        "boundary": 337,
+        "threshold": 3
+      },
+      "appliesTotal": 342,
+      "thresholdCrossings": 3,
+      "jobsStarted": 342,
+      "coldMisses": 1,
+      "coldMissTokens": 51595,
+      "applyRereadTokenPrefix": 10777214,
+      "applyRereadBlockLevel": 2074714,
+      "prefillTokenPrefix": 68413571,
+      "prefillBlockLevel": 59711071,
+      "summaryStartTokens": 0,
+      "summaryEndTokens": 30914,
+      "summaryMaxTokens": 7237,
+      "summaryWriteTokens": 2074714,
+      "notesAppends": 0,
+      "notesBlocks": 0,
+      "consolidations": 0,
+      "finalContextTokens": 1126646
+    },
+    {
+      "policy": "early-notes",
+      "applies": {
+        "cold": 2,
+        "boundary": 353,
+        "threshold": 2
+      },
+      "appliesTotal": 357,
+      "thresholdCrossings": 2,
+      "jobsStarted": 357,
+      "coldMisses": 1,
+      "coldMissTokens": 118671,
+      "applyRereadTokenPrefix": 13888911,
+      "applyRereadBlockLevel": 3738140,
+      "prefillTokenPrefix": 71673597,
+      "prefillBlockLevel": 61522826,
+      "summaryStartTokens": 0,
+      "summaryEndTokens": 30914,
+      "summaryMaxTokens": 88308,
+      "summaryWriteTokens": 3738140,
+      "notesAppends": 176,
+      "notesBlocks": 0,
+      "consolidations": 176,
+      "finalContextTokens": 1219283
+    }
+  ],
+  "checks": {
+    "rowsPerSessionPolicy": true,
+    "forbiddenTextScan": {
+      "windows": 12624,
+      "matches": 0
+    },
+    "tempCopyRemoved": true
+  }
+}
