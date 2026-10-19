@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   BREAKER_WARNING,
   COMMAND_DESCRIPTION,
+  CONFIG_INVALID_WARNING,
   COMMAND_NAME,
   MODEL_UNRESOLVED_WARNING,
   ROUTE_WORDS,
@@ -269,6 +270,18 @@ describe("warnings", () => {
       { message: MODEL_UNRESOLVED_WARNING, type: "warning" },
     ]);
     expect(surface.snapshot().warnings).toEqual(["breaker", "model-unresolved"]);
+  });
+
+  test("an unusable config warns once per session", () => {
+    const { ui, surface } = activeSurface();
+
+    surface.warnConfigInvalid();
+    surface.warnConfigInvalid();
+
+    expect(ui.notifications).toEqual([
+      { message: CONFIG_INVALID_WARNING, type: "warning" },
+    ]);
+    expect(surface.snapshot().warnings).toEqual(["config-invalid"]);
   });
 
   test("each cause has its own once-per-session slot", () => {

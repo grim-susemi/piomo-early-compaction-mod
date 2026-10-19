@@ -60,6 +60,8 @@ export interface ExtensionConfig {
   mode: CompactionMode;
   policy: PolicyConfig;
   allowRpcInteractive: boolean;
+  /** Set when a config file existed but could not be used in full. */
+  configIssue?: "unreadable" | "invalid" | undefined;
 }
 
 /** Test seams; production uses every default. */
@@ -106,32 +108,45 @@ function defaultConfig(): ExtensionConfig {
 /** Validate the config file; a bad file falls back to defaults, never throws. */
 export function resolveExtensionConfig(value: unknown): ExtensionConfig {
   const defaults = defaultConfig();
-  if (!isRecord(value)) return defaults;
-  if (value.schema !== undefined && value.schema !== 1) return defaults;
+  if (!isRecord(value)) return { ...defaults, configIssue: "invalid" };
+  if (value.schema !== undefined && value.schema !== 1) {
+    return { ...defaults, configIssue: "invalid" };
+  }
 
   const mode: CompactionMode = value.mode === "rewrite" ? "rewrite" : "notes";
   let policy = defaults.policy;
+  let configIssue: ExtensionConfig["configIssue"];
   try {
     policy = resolvePolicyConfig(value.policy ?? {});
   } catch {
     policy = defaults.policy;
+    configIssue = "invalid";
   }
   return {
     mode,
     policy,
     allowRpcInteractive: value.allowRpcInteractive === true,
+    configIssue,
   };
 }
 
-/** Read `<agentDir>/early-compaction/config.json`; missing/bad = defaults. */
+/**
+ * Read `<agentDir>/early-compaction/config.json`. A missing file is normal
+ * (defaults, no issue); an unreadable or malformed file falls back to defaults
+ * and sets `configIssue` so the session can warn once.
+ */
 export function readExtensionConfig(agentDir: string): ExtensionConfig {
+  let text: string;
   try {
-    const raw = JSON.parse(
-      readFileSync(join(agentDir, "early-compaction", "config.json"), "utf8"),
-    ) as unknown;
-    return resolveExtensionConfig(raw);
+    text = readFileSync(join(agentDir, "early-compaction", "config.json"), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return defaultConfig();
+    return { ...defaultConfig(), configIssue: "unreadable" };
+  }
+  try {
+    return resolveExtensionConfig(JSON.parse(text) as unknown);
   } catch {
-    return defaultConfig();
+    return { ...defaultConfig(), configIssue: "invalid" };
   }
 }
 
@@ -304,6 +319,13 @@ export function createEarlyCompactionExtension(
       }
 
       const surface = makeSurface(context, effectiveGate, config);
+      if (config.configIssue !== undefined && effectiveGate.state === "active") {
+        try {
+          surface.warnConfigInvalid();
+        } catch {
+          // A broken UI must not stop the session; the defaults still apply.
+        }
+      }
       const cache = (options.createCache ?? ((clock) => createCacheStateTracker({ now: clock })))(
         now,
       );

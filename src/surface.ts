@@ -100,7 +100,11 @@ export interface SurfaceCommandContext {
 }
 
 /** Warning causes remembered per session. */
-export type SurfaceWarningCause = "dormancy" | "breaker" | "model-unresolved";
+export type SurfaceWarningCause =
+  | "dormancy"
+  | "breaker"
+  | "model-unresolved"
+  | "config-invalid";
 
 export interface SurfaceOptions {
   readonly ui: SurfaceUI;
@@ -138,6 +142,8 @@ export interface VisibleSurface {
   warnBreakerOpened(): void;
   /** One warning per session when `compaction.model` cannot be resolved. */
   warnModelUnresolved(): void;
+  /** One warning per session when config.json was unusable and defaults apply. */
+  warnConfigInvalid(): void;
   /** Read-only command text: state, mode, route counts, last apply, dormancy. */
   statusText(): string;
   /** Print `statusText()` as one info notice; never mutates surface state. */
@@ -165,6 +171,11 @@ export const BREAKER_WARNING =
 export const MODEL_UNRESOLVED_WARNING =
   "piomo early-compaction: compaction model is not in the model registry; " +
   "skipping early summaries.";
+
+/** Warning text when config.json exists but could not be used in full. */
+export const CONFIG_INVALID_WARNING =
+  "piomo early-compaction: config.json is unreadable or invalid; " +
+  "built-in defaults are in use.";
 
 /** Tokens in thousands, rounded to the nearest thousand. */
 export function thousands(tokens: number): number {
@@ -282,6 +293,10 @@ export function createSurface(options: SurfaceOptions): VisibleSurface {
 
     warnModelUnresolved(): void {
       warnOnce("model-unresolved", MODEL_UNRESOLVED_WARNING);
+    },
+
+    warnConfigInvalid(): void {
+      warnOnce("config-invalid", CONFIG_INVALID_WARNING);
     },
 
     statusText(): string {
