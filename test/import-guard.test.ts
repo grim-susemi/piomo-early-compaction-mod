@@ -80,6 +80,22 @@ describe("import guard", () => {
     }
   });
 
+  test("template with an exact allowed-root head plus substitution fails", () => {
+    const dir = makeFixture({
+      "root-head-sub.ts":
+        "export async function load() {\n" +
+        "  return await import(" + BT + "@code-yeongyu/senpi" + '${"/dist/core/agent-session.js"}' + BT + ");\n" +
+        "}\n",
+    });
+    try {
+      const r = runGuard(dir);
+      expect(r.exit).toBe(1);
+      expect(r.stderr).toContain("root-head-sub.ts");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("template with a non-allowlist head fails", () => {
     const dir = makeFixture({
       "bad-head.ts":
