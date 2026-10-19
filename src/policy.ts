@@ -434,6 +434,11 @@ export interface RunEndState {
 export interface ApplyDecisionInput {
   contextTokens: number | null;
   contextWindow: number;
+  /**
+   * Tokens of the prompt being submitted at the input seam. They are not in U
+   * yet, so the input-seam threshold check uses U + promptTokens (default 0).
+   */
+  promptTokens?: number;
   lastYield?: LastYield | null;
   jobReady: boolean;
   /** Tokens appended after the prepared cut. */
@@ -489,7 +494,9 @@ export function isApplyPermissionOpen(
 /**
  * Route precedence: threshold, then cold, then boundary. Threshold is first so
  * the safety route is never relabeled when the cache also happens to be cold.
- * The input seam admits only the threshold route.
+ * The input seam admits the threshold and cold routes; boundary is only for an
+ * agent_settled/timer apply. A closed prompt permission is bypassed only for
+ * the input-seam threshold route.
  */
 export function applyDecision(input: ApplyDecisionInput): ApplyRoute {
   const config = input.config ?? DEFAULTS;
@@ -517,8 +524,10 @@ export function applyDecision(input: ApplyDecisionInput): ApplyRoute {
     return "none";
   }
 
+  const thresholdUsage = input.site === "input" ? used + (input.promptTokens ?? 0) : used;
   const thresholdEligible =
-    config.thresholdRoute && used >= window * computeEffectiveThreshold(window, input.lastYield ?? undefined);
+    config.thresholdRoute &&
+    thresholdUsage >= window * computeEffectiveThreshold(window, input.lastYield ?? undefined);
   const thresholdException = input.site === "input" && thresholdEligible;
   const permissionOpen = isApplyPermissionOpen(input.permission, input.site, input.now, {
     thresholdException,
@@ -537,7 +546,8 @@ export function applyDecision(input: ApplyDecisionInput): ApplyRoute {
     return "threshold";
   }
   if (input.site === "input") {
-    return "none";
+    // The input handler applies on threshold or cold; boundary needs a settled run.
+    return input.cache === "cold" ? "cold" : "none";
   }
 
   if (input.cache === "cold") {

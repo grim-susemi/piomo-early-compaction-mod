@@ -241,20 +241,27 @@ function startInput(overrides: Partial<StartJobInput> = {}): StartJobInput {
 }
 
 describe("shouldStartJob", () => {
-  test("starts exactly at U = 0.40W, not one token below", () => {
-    expect(shouldStartJob(startInput()).start).toBe(true);
+  test("starts exactly at U = 0.40W or above, not one token below", () => {
     expect(shouldStartJob(startInput({ contextTokens: 39_999 }))).toEqual({
       start: false,
       reason: "below-start-ratio",
     });
+    expect(shouldStartJob(startInput({ contextTokens: 40_000 })).start).toBe(true);
+    expect(shouldStartJob(startInput({ contextTokens: 40_001 })).start).toBe(true);
   });
 
   test("growth floor is max(4096, 0.05W)", () => {
-    // 0.05 * 100000 = 5000 dominates 4096.
-    expect(shouldStartJob(startInput({ growthSincePreparedTokens: 5_000 })).start).toBe(true);
+    // 0.05 * 100000 = 5000 dominates 4096: 4999 blocks, 5000 and 5001 start.
     expect(shouldStartJob(startInput({ growthSincePreparedTokens: 4_999 })).start).toBe(false);
+    expect(shouldStartJob(startInput({ growthSincePreparedTokens: 5_000 })).start).toBe(true);
+    expect(shouldStartJob(startInput({ growthSincePreparedTokens: 5_001 })).start).toBe(true);
 
-    // At W = 50000 the fixed 4096 floor dominates 2500.
+    // At W = 50000 the fixed 4096 floor dominates 2500: 4095 blocks, 4096 and 4097 start.
+    expect(
+      shouldStartJob(
+        startInput({ contextWindow: 50_000, contextTokens: 20_000, growthSincePreparedTokens: 4_095 }),
+      ).start,
+    ).toBe(false);
     expect(
       shouldStartJob(
         startInput({ contextWindow: 50_000, contextTokens: 20_000, growthSincePreparedTokens: 4_096 }),
@@ -262,9 +269,9 @@ describe("shouldStartJob", () => {
     ).toBe(true);
     expect(
       shouldStartJob(
-        startInput({ contextWindow: 50_000, contextTokens: 20_000, growthSincePreparedTokens: 4_095 }),
+        startInput({ contextWindow: 50_000, contextTokens: 20_000, growthSincePreparedTokens: 4_097 }),
       ).start,
-    ).toBe(false);
+    ).toBe(true);
   });
 
   test("has no upper bound: a start is allowed at and above T", () => {
@@ -393,10 +400,11 @@ function applyInput(overrides: Partial<ApplyDecisionInput> = {}): ApplyDecisionI
 }
 
 describe("applyDecision common conditions", () => {
-  test("threshold boundary: U >= T, one token below is not threshold", () => {
-    const below = applyInput({ contextTokens: 59_999, growthSinceAppliedTokens: 0, runEnd: null });
-    expect(applyDecision(below)).toBe("none");
-    expect(applyDecision(applyInput({ contextTokens: 60_000 }))).toBe("threshold");
+  test("threshold boundary: U >= T, one token on each side", () => {
+    const base = { growthSinceAppliedTokens: 0, runEnd: null };
+    expect(applyDecision(applyInput({ ...base, contextTokens: 59_999 }))).toBe("none");
+    expect(applyDecision(applyInput({ ...base, contextTokens: 60_000 }))).toBe("threshold");
+    expect(applyDecision(applyInput({ ...base, contextTokens: 60_001 }))).toBe("threshold");
   });
 
   test("lastYield moves T exactly like the builtin", () => {
@@ -438,9 +446,13 @@ describe("applyDecision common conditions", () => {
   });
 
   test("READY staleness is max(keepRecentEff, 0.10W)", () => {
+    expect(applyDecision(applyInput({ tokensAppendedAfterCut: 19_999 }))).toBe("boundary");
     expect(applyDecision(applyInput({ tokensAppendedAfterCut: 20_000 }))).toBe("boundary");
     expect(applyDecision(applyInput({ tokensAppendedAfterCut: 20_001 }))).toBe("none");
     // 0.10W dominates a smaller keepRecent.
+    expect(
+      applyDecision(applyInput({ effectiveKeepRecentTokens: 1_000, tokensAppendedAfterCut: 9_999 })),
+    ).toBe("boundary");
     expect(
       applyDecision(applyInput({ effectiveKeepRecentTokens: 1_000, tokensAppendedAfterCut: 10_000 })),
     ).toBe("boundary");
@@ -474,6 +486,16 @@ describe("apply permission", () => {
     ).toBe("none");
     expect(
       applyDecision(
+        applyInput({ now, site: "timer", permission: { lastPromptAt: now - 1_000 } }),
+      ),
+    ).toBe("none");
+    expect(
+      applyDecision(
+        applyInput({ now, cache: "cold", permission: { lastPromptAt: now - 1_000 } }),
+      ),
+    ).toBe("none");
+    expect(
+      applyDecision(
         applyInput({
           now,
           permission: { lastPromptAt: now - 1_000, lastAgentSettledAt: now - 500 },
@@ -501,32 +523,38 @@ describe("apply permission", () => {
     expect(applyDecision(applyInput({ site: "agent_settled", todoRestorePending: true }))).toBe("boundary");
   });
 
-  test("the input seam admits only a threshold apply, even when the prompt closed permission", () => {
+  test("the input seam admits threshold and cold; closed permission only makes threshold the exception", () => {
     const now = 1_000_000;
     const closed = { lastPromptAt: now };
+    const base = { now, site: "input" as const, growthSinceAppliedTokens: 0, runEnd: null };
+
+    // Open permission, cold cache: the input handler applies cold like settled/timer.
+    expect(applyDecision(applyInput({ ...base, cache: "cold", permission: {} }))).toBe("cold");
+    // Closed permission, cold cache: the exception is threshold-only, so none.
+    expect(applyDecision(applyInput({ ...base, cache: "cold", permission: closed }))).toBe("none");
+
+    // Closed permission at/above T: threshold is the one admitted route.
+    expect(
+      applyDecision(applyInput({ ...base, cache: "warm", contextTokens: 60_000, permission: closed })),
+    ).toBe("threshold");
+    expect(
+      applyDecision(applyInput({ ...base, cache: "warm", contextTokens: 59_999, permission: closed })),
+    ).toBe("none");
+
+    // The submitted prompt counts toward T at the input seam.
     expect(
       applyDecision(
-        applyInput({
-          now,
-          site: "input",
-          contextTokens: 60_000,
-          growthSinceAppliedTokens: 0,
-          runEnd: null,
-          permission: closed,
-        }),
+        applyInput({ ...base, cache: "warm", contextTokens: 59_999, promptTokens: 1, permission: closed }),
       ),
     ).toBe("threshold");
     expect(
       applyDecision(
-        applyInput({ now, site: "input", cache: "cold", growthSinceAppliedTokens: 0, runEnd: null, permission: closed }),
+        applyInput({ ...base, cache: "warm", contextTokens: 59_998, promptTokens: 1, permission: closed }),
       ),
     ).toBe("none");
-    // Open permission at the input seam still admits only threshold.
-    expect(
-      applyDecision(
-        applyInput({ now, site: "input", cache: "cold", growthSinceAppliedTokens: 0, runEnd: null, permission: {} }),
-      ),
-    ).toBe("none");
+
+    // Open permission, warm cache, below T: boundary needs a settled run, so none.
+    expect(applyDecision(applyInput({ ...base, cache: "warm", permission: {} }))).toBe("none");
   });
 
   test("isApplyPermissionOpen exposes the same rules", () => {
