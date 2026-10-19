@@ -7,9 +7,14 @@
  * report. The temporary copies are always deleted; no message text, prompt or
  * session id reaches the reports.
  *
- * Policy decisions come from `src/policy.ts`; the cut keeps the effective
- * keep-recent tail exactly as `src/prepare.ts` computes it, recomputed at
- * every simulated compaction. The size model is:
+ * Every early-policy apply is decided by `applyDecision` from `src/policy.ts`
+ * at a recorded run end (`stopReason` "stop"); a tool-use turn never applies
+ * and is never a boundary. Cuts come from `src/prepare.ts` (`prepareSource` ->
+ * `findCutPoint`) over identity-preserving branch entry stubs, so whole-message,
+ * tool-tail, split-turn and keep-recent semantics are the production ones.
+ * Recorded compactions reset the simulated context at the following request;
+ * for stock they are the baseline applies. Total prefill includes the initial
+ * cold request for every policy. The size model is:
  *   notes   = 0.08 * span tokens (the appended block)
  *   rewrite = median of the summary token counts recorded in the same session
  *             (fallback 0.10 * span when the session has no compaction)
@@ -44,10 +49,10 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { estimateTokens } from "@code-yeongyu/senpi";
+import { estimateTokens, type SessionEntry } from "@code-yeongyu/senpi";
 import {
   DEFAULTS,
-  benefitOk,
+  applyDecision,
   computeEffectiveKeepRecentTokens,
   computeEffectiveThreshold,
   nextJobKind,
@@ -55,6 +60,7 @@ import {
   type LastYield,
   type PolicyConfig,
 } from "../src/policy";
+import { prepareSource } from "../src/prepare";
 import { summaryTokens } from "../src/constants";
 
 // ---------------------------------------------------------------------------
@@ -91,6 +97,8 @@ export interface ReplayRequest {
   provider: string;
   modelId: string;
   stopReason: string | null;
+  /** Index in `ReplayBranch.entries` of the assistant entry that produced this usage. */
+  entryIndex?: number;
 }
 
 export interface ReplayCompaction {
@@ -98,6 +106,47 @@ export interface ReplayCompaction {
   tokensBefore: number;
   summaryTokens: number;
   schema: string;
+  firstKeptEntryId?: string;
+  entryIndex?: number;
+}
+
+/**
+ * Compact identity-preserving metadata for one recorded branch entry. The
+ * message text is not retained: only what the todo 6 cut needs (identity,
+ * parent chain, role, stop reason, tool-call pairing) and the token estimate
+ * measured while the entry was parsed. `qa/replay.ts` rebuilds minimal entry
+ * stubs from this metadata when it asks `prepareSource` for a cut, so the
+ * live replay does not hold hundreds of megabytes of conversation text.
+ */
+export interface ReplayEntryMeta {
+  index: number;
+  id: string;
+  parentId: string | null;
+  timestamp: number;
+  type: string;
+  role?: string;
+  stopReason?: string;
+  customType?: string;
+  toolCallId?: string;
+  toolCallIds?: string[];
+  /** estimateTokens() of the original entry message. */
+  tokens: number;
+  firstKeptEntryId?: string;
+  /** Recorded compaction summary size (compaction entries only). */
+  summaryTokens?: number;
+}
+
+/** A context edit that applies to requests at or after `index`. */
+export interface ReplayEdit {
+  index: number;
+  targetId: string;
+  /** Replacement message size; null removes the target from context. */
+  replacementTokens: number | null;
+}
+
+export interface ReplayBranch {
+  entries: ReplayEntryMeta[];
+  edits: ReplayEdit[];
 }
 
 export interface ParsedSession {
@@ -105,6 +154,7 @@ export interface ParsedSession {
   hash: string;
   requests: ReplayRequest[];
   compactions: ReplayCompaction[];
+  branch: ReplayBranch;
 }
 
 export type ParseResult =
@@ -121,6 +171,10 @@ export interface PolicyRow {
   policy: ReplayPolicy;
   applies: AppliesByRoute;
   appliesTotal: number;
+  /** Apply evaluations that used the scalar fallback (no entry identity). */
+  cutFallbacks: number;
+  /** Apply evaluations where prepareSource found nothing to summarize. */
+  cutUnavailable: number;
   thresholdCrossings: number;
   jobsStarted: number;
   coldMisses: number;
@@ -192,10 +246,409 @@ export function rewriteSummaryTokens(
   return Math.max(0, Math.min(raw, Math.max(0, Math.round(spanTokens))));
 }
 
-/** The token-level cut used by the replay: keep the last `keepRecentEff` tokens. */
+/**
+ * Scalar fallback used only for synthetic callers that supply no branch entry
+ * identities (the gate fixtures and size-model tests). The live CLI always
+ * resolves the cut structurally from the recorded branch entries.
+ */
 export function spanTokensFor(contextTokens: number, keepRecentEff: number): number {
   if (!Number.isFinite(contextTokens) || contextTokens <= 0) return 0;
   return Math.max(0, Math.round(contextTokens - Math.max(0, keepRecentEff)));
+}
+
+// ---------------------------------------------------------------------------
+// Structural cut (todo 6 semantics)
+// ---------------------------------------------------------------------------
+
+const REPLAY_RESERVE_TOKENS = 16_384;
+
+export interface BranchIndex {
+  branch: ReplayBranch;
+  entries: ReplayEntryMeta[];
+  byId: Map<string, ReplayEntryMeta>;
+  prefixTokens(id: string | null | undefined): number;
+  contextStart(id: string | null | undefined): number;
+  budgetTokens(meta: ReplayEntryMeta): number;
+  editFor(id: string, upToIndex: number): ReplayEdit | undefined;
+}
+
+export function buildBranchIndex(branch: ReplayBranch): BranchIndex {
+  const entries = branch.entries;
+  const byId = new Map<string, ReplayEntryMeta>();
+  for (const meta of entries) byId.set(meta.id, meta);
+
+  const keptCallIds = new Set<string>();
+  const failedCallIds = new Set<string>();
+  for (const meta of entries) {
+    if (meta.type !== "message" || meta.role !== "assistant") continue;
+    const failed = meta.stopReason === "error" || meta.stopReason === "aborted";
+    for (const id of meta.toolCallIds ?? []) {
+      (failed ? failedCallIds : keptCallIds).add(id);
+    }
+  }
+  for (const id of keptCallIds) failedCallIds.delete(id);
+
+  const prefixCache = new Map<string, number>();
+  const startCache = new Map<string, number>();
+
+  const prefixTokens = (id: string | null | undefined): number => {
+    if (!id) return 0;
+    const cached = prefixCache.get(id);
+    if (cached !== undefined) return cached;
+    const chain: ReplayEntryMeta[] = [];
+    let current = byId.get(id);
+    let base = 0;
+    while (current) {
+      const known = prefixCache.get(current.id);
+      if (known !== undefined) {
+        base = known;
+        break;
+      }
+      chain.push(current);
+      if (!current.parentId) break;
+      current = byId.get(current.parentId);
+    }
+    for (let i = chain.length - 1; i >= 0; i--) {
+      base += chain[i].tokens;
+      prefixCache.set(chain[i].id, base);
+    }
+    return prefixCache.get(id) ?? base;
+  };
+
+  const contextStart = (id: string | null | undefined): number => {
+    if (!id) return 0;
+    const cached = startCache.get(id);
+    if (cached !== undefined) return cached;
+    const chain: ReplayEntryMeta[] = [];
+    let current = byId.get(id);
+    let value = 0;
+    while (current) {
+      const known = startCache.get(current.id);
+      if (known !== undefined) {
+        value = known;
+        break;
+      }
+      if (current.type === "compaction") {
+        const firstKept = current.firstKeptEntryId ? byId.get(current.firstKeptEntryId) : undefined;
+        value = firstKept ? Math.min(firstKept.index, current.index) : current.index;
+        break;
+      }
+      chain.push(current);
+      if (!current.parentId) {
+        value = current.index;
+        break;
+      }
+      const parent = byId.get(current.parentId);
+      if (!parent) {
+        value = current.index;
+        break;
+      }
+      current = parent;
+    }
+    for (const meta of chain) startCache.set(meta.id, value);
+    startCache.set(id, value);
+    return value;
+  };
+
+  const budgetTokens = (meta: ReplayEntryMeta): number => {
+    if (meta.type !== "message" && meta.type !== "custom_message" && meta.type !== "branch_summary") {
+      return 0;
+    }
+    if (meta.type === "message" && meta.role === "assistant") {
+      // dropFailedAssistantTurns excludes failed turns from the keep budget.
+      if (meta.stopReason === "error" || meta.stopReason === "aborted") return 0;
+      return meta.tokens;
+    }
+    if (meta.type === "message" && meta.role === "toolResult" && meta.toolCallId) {
+      if (failedCallIds.has(meta.toolCallId) && !keptCallIds.has(meta.toolCallId)) return 0;
+    }
+    return meta.tokens;
+  };
+
+  const editFor = (id: string, upToIndex: number): ReplayEdit | undefined => {
+    let found: ReplayEdit | undefined;
+    for (const edit of branch.edits) {
+      if (edit.index > upToIndex || edit.targetId !== id) continue;
+      if (!found || edit.index > found.index) found = edit;
+    }
+    return found;
+  };
+
+  return { branch, entries, byId, prefixTokens, contextStart, budgetTokens, editFor };
+}
+
+function stubText(chars: number): string {
+  if (chars <= 0) return "";
+  // Alternate with spaces: a long alphanumeric run would trigger senpi's
+  // base64 weighting and make the stub estimate 4x the measured token count.
+  const pairs = Math.floor(chars / 2);
+  return "x ".repeat(pairs) + (chars % 2 === 1 ? "x" : "");
+}
+
+/**
+ * Rebuild one minimal entry from metadata, sized so `estimateTokens()` returns
+ * the same count that was measured on the original message. Tool-call ids are
+ * preserved so `dropFailedAssistantTurns` sees the same pairing.
+ */
+function stubEntry(meta: ReplayEntryMeta, edit: ReplayEdit | undefined): SessionEntry {
+  const id = meta.id;
+  const parentId = meta.parentId;
+  const timestamp = new Date(Number.isFinite(meta.timestamp) ? meta.timestamp : 0).toISOString();
+
+  if (edit && edit.replacementTokens === null) {
+    return {
+      id,
+      parentId,
+      timestamp,
+      type: "custom",
+      customType: "replay.context-edit-omitted",
+    } as unknown as SessionEntry;
+  }
+
+  const tokens = edit ? Math.max(0, edit.replacementTokens ?? 0) : meta.tokens;
+  const chars = Math.max(0, Math.round(tokens * 4));
+
+  if (meta.type === "message" && meta.role) {
+    if (meta.role === "assistant") {
+      const callIds = meta.toolCallIds ?? [];
+      // name "x" (1 char) + JSON arguments "{}" (2 chars) per call.
+      const callChars = callIds.length * 3;
+      const textChars = Math.max(0, chars - callChars);
+      const content: unknown[] = [];
+      if (textChars > 0) content.push({ type: "text", text: stubText(textChars) });
+      for (const callId of callIds) {
+        content.push({ type: "toolCall", id: callId, name: "x", arguments: {} });
+      }
+      return {
+        id,
+        parentId,
+        timestamp,
+        type: "message",
+        message: {
+          role: "assistant",
+          content,
+          stopReason: meta.stopReason ?? "stop",
+          timestamp: 0,
+          provider: "replay",
+          model: "replay",
+        },
+      } as unknown as SessionEntry;
+    }
+    if (meta.role === "toolResult") {
+      return {
+        id,
+        parentId,
+        timestamp,
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolCallId: meta.toolCallId ?? "replay",
+          toolName: "replay",
+          content: [{ type: "text", text: stubText(chars) }],
+          isError: false,
+          timestamp: 0,
+        },
+      } as unknown as SessionEntry;
+    }
+    return {
+      id,
+      parentId,
+      timestamp,
+      type: "message",
+      message: {
+        role: meta.role,
+        content: [{ type: "text", text: stubText(chars) }],
+        timestamp: 0,
+      },
+    } as unknown as SessionEntry;
+  }
+
+  if (meta.type === "custom_message") {
+    return {
+      id,
+      parentId,
+      timestamp,
+      type: "custom_message",
+      customType: meta.customType ?? "replay",
+      content: [{ type: "text", text: stubText(chars) }],
+      display: false,
+    } as unknown as SessionEntry;
+  }
+
+  if (meta.type === "branch_summary") {
+    return {
+      id,
+      parentId,
+      timestamp,
+      type: "branch_summary",
+      fromId: meta.parentId ?? "",
+      summary: stubText(chars),
+    } as unknown as SessionEntry;
+  }
+
+  return {
+    id,
+    parentId,
+    timestamp,
+    type: "custom",
+    customType: "replay.metadata",
+  } as unknown as SessionEntry;
+}
+
+interface WindowSlice {
+  metas: ReplayEntryMeta[];
+  reachedStart: boolean;
+}
+
+function buildCutWindow(
+  index: BranchIndex,
+  end: ReplayEntryMeta,
+  startIndex: number,
+  targetTokens: number,
+): WindowSlice {
+  const backward: ReplayEntryMeta[] = [];
+  let accumulated = 0;
+  let current: ReplayEntryMeta | undefined = end;
+
+  while (current && current.index >= startIndex && accumulated < targetTokens) {
+    backward.push(current);
+    accumulated += index.budgetTokens(current);
+    if (current.index <= startIndex) break;
+    current = current.parentId ? index.byId.get(current.parentId) : undefined;
+    if (!current || current.index < startIndex) break;
+  }
+
+  // Walk back over adjacent non-context entries and include the previous
+  // context-visible entry, so findCutPoint's metadata scan sees the same
+  // boundary it would see on the full branch.
+  let cursor = current;
+  while (cursor && cursor.index >= startIndex) {
+    backward.push(cursor);
+    const visible =
+      cursor.type === "message" || cursor.type === "custom_message" || cursor.type === "branch_summary";
+    if (visible) break;
+    cursor = cursor.parentId ? index.byId.get(cursor.parentId) : undefined;
+  }
+
+  const oldest = backward[backward.length - 1];
+  const oldestParent = oldest?.parentId ? index.byId.get(oldest.parentId) : undefined;
+  const reachedStart =
+    oldest !== undefined &&
+    (oldest.index <= startIndex || !oldestParent || oldestParent.index < startIndex);
+
+  return { metas: backward.slice().reverse(), reachedStart };
+}
+
+export interface StructuralCut {
+  kind: "structural";
+  spanTokens: number;
+  firstKeptIndex: number;
+  firstKeptEntryId: string;
+}
+
+function editAdjustment(
+  index: BranchIndex,
+  fromIndex: number,
+  toIndex: number,
+  upToIndex: number,
+): number {
+  let adjustment = 0;
+  for (const edit of index.branch.edits) {
+    if (edit.index > upToIndex) continue;
+    const target = index.byId.get(edit.targetId);
+    if (!target || target.index < fromIndex || target.index >= toIndex) continue;
+    adjustment += target.tokens - (edit.replacementTokens ?? 0);
+  }
+  return adjustment;
+}
+
+type CutResolution = StructuralCut | "fallback" | "unavailable";
+
+/**
+ * Resolve the remove-prefix cut for one request with the production
+ * `prepareSource` on identity-preserving entry stubs. Only the tail the keep
+ * budget can reach is rebuilt; older entries cannot affect findCutPoint's
+ * result because the backward walk stops as soon as the budget is reached.
+ * The summarized size is measured on the whole removed prefix via parent-chain
+ * token sums, so truncating the window does not truncate the span size.
+ */
+export function resolveStructuralCut(
+  branch: ReplayBranch,
+  request: ReplayRequest,
+  simStartIndex: number,
+  contextWindow: number,
+  thresholdRatio: number,
+  keepRecentTokens: number,
+): CutResolution {
+  return resolveCutWithIndex(
+    buildBranchIndex(branch),
+    request,
+    simStartIndex,
+    contextWindow,
+    thresholdRatio,
+    keepRecentTokens,
+  );
+}
+
+export function resolveCutWithIndex(
+  index: BranchIndex,
+  request: ReplayRequest,
+  simStartIndex: number,
+  contextWindow: number,
+  thresholdRatio: number,
+  keepRecentTokens: number,
+): CutResolution {
+  if (request.entryIndex === undefined) return "fallback";
+  const end = index.entries[request.entryIndex];
+  if (!end) return "fallback";
+  const startIndex = Math.max(0, Math.min(end.index, Math.max(simStartIndex, index.contextStart(end.id))));
+  const startMeta = index.entries[startIndex];
+  if (!startMeta) return "fallback";
+
+  for (const multiplier of [1.5, 3]) {
+    const target = Math.max(keepRecentTokens, Math.ceil(keepRecentTokens * multiplier));
+    const window = buildCutWindow(index, end, startIndex, target);
+    const stubs = window.metas.map((meta) => stubEntry(meta, index.editFor(meta.id, request.entryIndex!)));
+
+    let prepared;
+    try {
+      prepared = prepareSource({
+        branchEntries: stubs,
+        contextWindow,
+        thresholdRatio,
+        settings: { keepRecentTokens, reserveTokens: REPLAY_RESERVE_TOKENS },
+      });
+    } catch {
+      return "fallback";
+    }
+
+    if (!prepared) {
+      if (window.reachedStart) return "unavailable";
+      continue;
+    }
+    const firstKeptIndex = window.metas.findIndex((meta) => meta.id === prepared.firstKeptEntryId);
+    if (firstKeptIndex < 0) return "unavailable";
+    if (firstKeptIndex <= 0 && !window.reachedStart) {
+      // The window did not reach far enough for the budget walk; widen once.
+      continue;
+    }
+
+    const firstKept = window.metas[firstKeptIndex];
+    if (!firstKept) return "unavailable";
+    const prefix = index.prefixTokens(firstKept.parentId) - index.prefixTokens(startMeta.parentId);
+    const spanTokens = Math.max(
+      0,
+      prefix - editAdjustment(index, startIndex, firstKept.index, request.entryIndex),
+    );
+    return {
+      kind: "structural",
+      spanTokens,
+      firstKeptIndex: firstKept.index,
+      firstKeptEntryId: firstKept.id,
+    };
+  }
+
+  return "fallback";
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +710,8 @@ export function parseSessionText(text: string): ParseResult {
   let currentModelId = "";
   const requests: ReplayRequest[] = [];
   const compactions: ReplayCompaction[] = [];
+  const entries: ReplayEntryMeta[] = [];
+  const edits: ReplayEdit[] = [];
   let pendingTokens = 0;
 
   for (const raw of lines) {
@@ -283,40 +738,88 @@ export function parseSessionText(text: string): ParseResult {
 
     const entryTs = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : Number.NaN;
     const ts = Number.isFinite(entryTs) ? entryTs : 0;
+    const entryIndex = entries.length;
+    const entryType = typeof entry.type === "string" ? entry.type : "";
+    const meta: ReplayEntryMeta = {
+      index: entryIndex,
+      id: typeof entry.id === "string" ? entry.id : `entry-${entryIndex}`,
+      parentId: typeof entry.parentId === "string" ? entry.parentId : null,
+      timestamp: ts,
+      type: entryType,
+      tokens: 0,
+    };
 
-    if (entry.type === "model_change") {
+    if (entryType === "model_change") {
       currentProvider = typeof entry.provider === "string" ? entry.provider : currentProvider;
       currentModelId = typeof entry.modelId === "string" ? entry.modelId : currentModelId;
       pendingTokens = 0;
+      entries.push(meta);
       continue;
     }
 
-    if (entry.type === "compaction") {
+    if (entryType === "compaction") {
       const summary = typeof entry.summary === "string" ? entry.summary : "";
       const details =
         entry.details && typeof entry.details === "object"
           ? (entry.details as Record<string, unknown>)
           : {};
+      const firstKeptEntryId =
+        typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined;
+      meta.firstKeptEntryId = firstKeptEntryId;
+      meta.summaryTokens = summaryTokens(summary);
       compactions.push({
         ts,
         tokensBefore: numberField(entry.tokensBefore),
         summaryTokens: summaryTokens(summary),
         schema: typeof details.schema === "string" ? details.schema : "unknown",
+        firstKeptEntryId,
+        entryIndex,
       });
       // The recorded summary is not an append; the simulation owns its own summary.
+      entries.push(meta);
       continue;
     }
 
-    if (entry.type === "message" && entry.message && typeof entry.message === "object") {
+    if (entryType === "context_edit") {
+      if (typeof entry.targetId === "string") {
+        const replacement = entry.replacement;
+        edits.push({
+          index: entryIndex,
+          targetId: entry.targetId,
+          replacementTokens:
+            replacement === null
+              ? null
+              : estimateContentTokens(
+                  replacement && typeof replacement === "object"
+                    ? (replacement as Record<string, unknown>).content
+                    : replacement,
+                ),
+        });
+      }
+      entries.push(meta);
+      continue;
+    }
+
+    if (entryType === "message" && entry.message && typeof entry.message === "object") {
       const message = entry.message as Record<string, unknown>;
       const role = typeof message.role === "string" ? message.role : "";
+      meta.role = role;
+      meta.tokens = estimateMessageTokens(message);
       if (role === "assistant") {
+        meta.stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
+        const content = Array.isArray(message.content) ? message.content : [];
+        const toolCallIds: string[] = [];
+        for (const block of content) {
+          if (!block || typeof block !== "object") continue;
+          const record = block as Record<string, unknown>;
+          if (record.type === "toolCall" && typeof record.id === "string") toolCallIds.push(record.id);
+        }
+        if (toolCallIds.length > 0) meta.toolCallIds = toolCallIds;
+
         const parts = usageParts(message);
-        const stopReason = typeof message.stopReason === "string" ? message.stopReason : null;
+        const stopReason = meta.stopReason ?? null;
         const validUsage =
-          stopReason !== "aborted" &&
-          stopReason !== "error" &&
-          parts.prompt + parts.output > 0;
+          stopReason !== "aborted" && stopReason !== "error" && parts.prompt + parts.output > 0;
         if (validUsage) {
           requests.push({
             ts,
@@ -327,30 +830,50 @@ export function parseSessionText(text: string): ParseResult {
             provider: currentProvider,
             modelId: currentModelId,
             stopReason,
+            entryIndex,
           });
-          pendingTokens = parts.output > 0 ? parts.output : estimateMessageTokens(message);
+          pendingTokens = parts.output > 0 ? parts.output : meta.tokens;
         } else {
-          pendingTokens += estimateMessageTokens(message);
+          pendingTokens += meta.tokens;
         }
       } else {
-        pendingTokens += estimateMessageTokens(message);
+        if (role === "toolResult" && typeof message.toolCallId === "string") {
+          meta.toolCallId = message.toolCallId;
+        }
+        pendingTokens += meta.tokens;
       }
+      entries.push(meta);
       continue;
     }
 
-    if (entry.type === "custom_message") {
-      pendingTokens += estimateContentTokens(entry.content);
+    if (entryType === "custom_message") {
+      meta.customType = typeof entry.customType === "string" ? entry.customType : undefined;
+      meta.tokens = estimateMessageTokens({
+        role: "custom",
+        customType: meta.customType,
+        content: entry.content ?? [],
+        display: entry.display,
+        details: entry.details,
+        timestamp: 0,
+      });
+      pendingTokens += meta.tokens;
+      entries.push(meta);
       continue;
     }
 
-    if (entry.type === "branch_summary" && typeof entry.summary === "string") {
-      pendingTokens += Math.ceil(entry.summary.length / 4);
+    if (entryType === "branch_summary" && typeof entry.summary === "string") {
+      meta.tokens = Math.ceil(entry.summary.length / 4);
+      pendingTokens += meta.tokens;
+      entries.push(meta);
       continue;
     }
+
+    entries.push(meta);
   }
 
   if (!header) return { ok: false, reason: "missing-session-header" };
   if (requests.length === 0) return { ok: false, reason: "no-recorded-usage" };
+  if (entries.length === 0) return { ok: false, reason: "branch-unmapped" };
 
   const id = header.id as string;
   return {
@@ -360,6 +883,7 @@ export function parseSessionText(text: string): ParseResult {
       hash: hashId(id),
       requests,
       compactions,
+      branch: { entries, edits },
     },
   };
 }
@@ -650,6 +1174,8 @@ export interface SimulateOptions {
   recordedSummaryTokens: readonly number[];
   keepRecentTokens?: number;
   config?: PolicyConfig;
+  /** Recorded branch identities used to resolve the todo 6 structural cut. */
+  branch?: ReplayBranch;
 }
 
 function emptyRow(policy: ReplayPolicy): PolicyRow {
@@ -657,6 +1183,8 @@ function emptyRow(policy: ReplayPolicy): PolicyRow {
     policy,
     applies: { cold: 0, boundary: 0, threshold: 0 },
     appliesTotal: 0,
+    cutFallbacks: 0,
+    cutUnavailable: 0,
     thresholdCrossings: 0,
     jobsStarted: 0,
     coldMisses: 0,
@@ -676,6 +1204,10 @@ function emptyRow(policy: ReplayPolicy): PolicyRow {
   };
 }
 
+type SpanInfo =
+  | { kind: "structural"; spanTokens: number; firstKeptIndex: number }
+  | { kind: "scalar"; spanTokens: number };
+
 export function simulatePolicy(
   requests: readonly ReplayRequest[],
   options: SimulateOptions,
@@ -685,6 +1217,15 @@ export function simulatePolicy(
   const keepRecentSetting = options.keepRecentTokens ?? DEFAULT_KEEP_RECENT_TOKENS;
   if (requests.length === 0) return row;
 
+  const branchIndex = options.branch ? buildBranchIndex(options.branch) : undefined;
+  const recordedCompactions = options.branch
+    ? options.branch.entries
+        .filter((meta) => meta.type === "compaction")
+        .slice()
+        .sort((a, b) => a.index - b.index)
+    : [];
+  let compactionCursor = 0;
+  let simStartIndex = 0;
   let contextAfterRequest = requests[0].promptTokens;
   let summary = 0;
   let hasCompaction = false;
@@ -699,8 +1240,56 @@ export function simulatePolicy(
 
   for (let i = 0; i < requests.length; i++) {
     const request = requests[i];
+
+    // A recorded compaction reset the real context before this request. The
+    // simulation follows that recorded reset (shared by every policy) instead
+    // of accumulating through a session the provider already compacted.
+    let resyncCompaction: ReplayEntryMeta | undefined;
+    const crossedCompactions: ReplayEntryMeta[] = [];
+    if (request.entryIndex !== undefined) {
+      while (
+        compactionCursor < recordedCompactions.length &&
+        recordedCompactions[compactionCursor].index <= request.entryIndex
+      ) {
+        resyncCompaction = recordedCompactions[compactionCursor];
+        crossedCompactions.push(recordedCompactions[compactionCursor]);
+        compactionCursor += 1;
+      }
+    }
+    const resync = crossedCompactions.length > 0 && i > 0;
     const contextTokens =
-      i === 0 ? request.promptTokens : contextAfterRequest + Math.max(0, request.appendedTokens);
+      i === 0 || resync ? request.promptTokens : contextAfterRequest + Math.max(0, request.appendedTokens);
+    if (resync) {
+      simStartIndex = 0;
+      jobReady = false;
+      preparedBase = contextTokens;
+      preparedAtU = contextTokens;
+      appliedBase = contextTokens;
+      hasCompaction = true;
+      summary = resyncCompaction!.summaryTokens ?? summary;
+      notesBlocks = 0;
+      aboveThreshold = false;
+    }
+
+    if (resync && options.policy === "stock" && branchIndex) {
+      // The recording already contains stock's compactions. Use them as the
+      // stock baseline instead of re-simulating threshold applies on top.
+      for (const compaction of crossedCompactions) {
+        const writtenSummary = compaction.summaryTokens ?? 0;
+        row.applies.threshold += 1;
+        row.appliesTotal += 1;
+        row.thresholdCrossings += 1;
+        row.summaryWriteTokens += writtenSummary;
+        row.summaryMaxTokens = Math.max(row.summaryMaxTokens, writtenSummary);
+      }
+      summary = resyncCompaction!.summaryTokens ?? summary;
+      row.applyRereadTokenPrefix += contextTokens;
+      row.applyRereadBlockLevel += summary;
+      row.prefillTokenPrefix += contextTokens;
+      row.prefillBlockLevel += summary;
+      contextAfterRequest = contextTokens;
+      continue;
+    }
 
     const window = options.contextWindowFor(request.provider, request.modelId);
     const thresholdRatio = computeEffectiveThreshold(window, lastYield);
@@ -711,31 +1300,72 @@ export function simulatePolicy(
       thresholdRatio,
     );
 
-    if (contextTokens >= threshold && !aboveThreshold) {
+    if ((options.policy !== "stock" || !branchIndex) && contextTokens >= threshold && !aboveThreshold) {
       row.thresholdCrossings += 1;
       aboveThreshold = true;
     }
 
-    const span = spanTokensFor(contextTokens, keepRecentEff);
+    let cachedSpan: SpanInfo | null | undefined;
+    const getSpan = (): SpanInfo | null => {
+      if (cachedSpan !== undefined) return cachedSpan;
+      if (!branchIndex) {
+        row.cutFallbacks += 1;
+        cachedSpan = { kind: "scalar", spanTokens: spanTokensFor(contextTokens, keepRecentEff) };
+        return cachedSpan;
+      }
+      const cut = resolveCutWithIndex(
+        branchIndex,
+        request,
+        simStartIndex,
+        window,
+        thresholdRatio,
+        keepRecentEff,
+      );
+      if (cut === "unavailable") {
+        row.cutUnavailable += 1;
+        cachedSpan = null;
+        return cachedSpan;
+      }
+      if (cut === "fallback") {
+        row.cutFallbacks += 1;
+        cachedSpan = { kind: "scalar", spanTokens: spanTokensFor(contextTokens, keepRecentEff) };
+        return cachedSpan;
+      }
+      cachedSpan = cut;
+      return cachedSpan;
+    };
+
     let route: "cold" | "boundary" | "threshold" | null = null;
     let applied = false;
     let applyAfter = contextTokens;
     let written = 0;
 
+    const applyFullRewrite = (spanInfo: SpanInfo, routeName: "threshold"): boolean => {
+      if (spanInfo.spanTokens <= 0) return false;
+      const candidate = rewriteSummaryTokens(options.recordedSummaryTokens, spanInfo.spanTokens);
+      summary = candidate;
+      hasCompaction = true;
+      notesBlocks = 0;
+      written = candidate;
+      applyAfter = Math.max(0, contextTokens - spanInfo.spanTokens) + candidate;
+      applied = true;
+      route = routeName;
+      if (spanInfo.kind === "structural") simStartIndex = spanInfo.firstKeptIndex;
+      return true;
+    };
+
+    const settled = request.stopReason === "stop";
     if (i === 0) {
       // Before the first prompt only the builtin safety net can act.
-      if (contextTokens >= threshold) {
-        const candidate = rewriteSummaryTokens(options.recordedSummaryTokens, span);
-        summary = candidate;
-        hasCompaction = true;
-        notesBlocks = 0;
-        written = candidate;
-        applyAfter = keepRecentEff + candidate;
-        applied = true;
-        route = "threshold";
+      if (settled && contextTokens >= threshold) {
+        const spanInfo = getSpan();
+        if (spanInfo) applyFullRewrite(spanInfo, "threshold");
       }
     } else if (options.policy === "stock") {
-      if (contextTokens >= threshold) route = "threshold";
+      if (!branchIndex && contextTokens >= threshold) {
+        const spanInfo = getSpan();
+        if (spanInfo) applyFullRewrite(spanInfo, "threshold");
+      }
     } else {
       const staleAllowance = Math.max(keepRecentEff, config.staleWindowRatio * window);
       if (jobReady && contextTokens - preparedAtU > staleAllowance) jobReady = false;
@@ -759,41 +1389,62 @@ export function simulatePolicy(
         }
       }
 
-      if (contextTokens >= threshold && !jobReady) {
+      if (settled && contextTokens >= threshold && !jobReady) {
         // The builtin safety net compacts even when no mod job is ready.
-        route = "threshold";
-      } else if (jobReady) {
-        const mode = options.policy === "early-notes" ? "notes" : "rewrite";
-        const kind = nextJobKind({
-          hasCompactionEntry: hasCompaction,
-          mode,
-          summaryTokens: summary,
-          notesBlocks,
-          config,
-        });
-        const candidate =
-          kind === "notes"
-            ? summary + notesSummaryTokens(span)
-            : rewriteSummaryTokens(options.recordedSummaryTokens, span);
-        const after = keepRecentEff + candidate;
-        if (benefitOk(contextTokens, after, config)) {
-          if (contextTokens >= threshold) {
-            route = "threshold";
-          } else if (options.coldAt(i)) {
-            route = "cold";
-          } else {
-            const boundaryFloor = Math.max(
-              config.boundaryGrowthMinTokens,
-              config.boundaryGrowthRatio * window,
-            );
-            if (contextTokens - appliedBase >= boundaryFloor) route = "boundary";
-          }
-          if (route !== null) {
+        const spanInfo = getSpan();
+        if (spanInfo) applyFullRewrite(spanInfo, "threshold");
+      } else if (settled && jobReady) {
+        const spanInfo = getSpan();
+        if (!spanInfo) {
+          // Nothing to summarize with the real cut; discard the READY job.
+          jobReady = false;
+        } else {
+          const mode = options.policy === "early-notes" ? "notes" : "rewrite";
+          const kind = nextJobKind({
+            hasCompactionEntry: hasCompaction,
+            mode,
+            summaryTokens: summary,
+            notesBlocks,
+            config,
+          });
+          const newNotes = notesSummaryTokens(spanInfo.spanTokens);
+          const candidate =
+            kind === "notes" ? summary + newNotes : rewriteSummaryTokens(options.recordedSummaryTokens, spanInfo.spanTokens);
+          const estimatedAfter = Math.max(0, contextTokens - spanInfo.spanTokens) + candidate;
+
+          // Every mod apply decision goes through the shared policy function;
+          // the replay only records the inputs (immediately READY job, settled
+          // run, warm/cold inference, valid anchor/fingerprint).
+          const decision = applyDecision({
+            contextTokens,
+            contextWindow: window,
+            jobReady: true,
+            tokensAppendedAfterCut: Math.max(0, contextTokens - preparedAtU),
+            effectiveKeepRecentTokens: keepRecentEff,
+            anchorValid: true,
+            fingerprintValid: true,
+            estimatedTokensAfter: estimatedAfter,
+            idle: true,
+            hasPendingMessages: false,
+            compacting: false,
+            site: "agent_settled",
+            now: request.ts,
+            permission: { lastPromptAt: null, lastAgentSettledAt: request.ts, lastDraftAt: null },
+            cache: options.coldAt(i) ? "cold" : "warm",
+            runEnd: { aborted: false, willRetry: false },
+            lastAssistantStopReason: request.stopReason,
+            growthSinceAppliedTokens: Math.max(0, contextTokens - appliedBase),
+            lastYield: lastYield ?? undefined,
+            config,
+          });
+
+          if (decision !== "none") {
+            route = decision;
             if (kind === "notes") {
               summary = candidate;
               notesBlocks += 1;
               row.notesAppends += 1;
-              written = notesSummaryTokens(span);
+              written = newNotes;
             } else {
               summary = candidate;
               notesBlocks = 0;
@@ -802,22 +1453,19 @@ export function simulatePolicy(
             }
             hasCompaction = true;
             jobReady = false;
-            applyAfter = after;
+            applyAfter = estimatedAfter;
             applied = true;
+            if (spanInfo.kind === "structural") simStartIndex = spanInfo.firstKeptIndex;
           }
         }
       }
     }
 
-    if (route === "threshold" && !applied) {
+    if (settled && route === "threshold" && !applied) {
       // Stock and the early safety fallback both use a full rewrite.
-      const candidate = rewriteSummaryTokens(options.recordedSummaryTokens, span);
-      summary = candidate;
-      hasCompaction = true;
-      notesBlocks = 0;
-      written = candidate;
-      applyAfter = keepRecentEff + candidate;
-      applied = true;
+      const spanInfo = getSpan();
+      if (spanInfo) applyFullRewrite(spanInfo, "threshold");
+      jobReady = false;
     }
 
     if (route !== null) {
@@ -844,12 +1492,19 @@ export function simulatePolicy(
       contextAfterRequest = applyAfter;
       aboveThreshold = applyAfter >= threshold;
     } else {
-      if (i > 0 && options.coldAt(i)) {
+      if (i === 0) {
+        // The initial request is a cold request for every policy; it belongs
+        // to both prefill totals even when no compaction applies there.
         row.coldMisses += 1;
         row.coldMissTokens += contextTokens;
         row.prefillTokenPrefix += contextTokens;
         row.prefillBlockLevel += contextTokens;
-      } else if (i > 0) {
+      } else if (options.coldAt(i)) {
+        row.coldMisses += 1;
+        row.coldMissTokens += contextTokens;
+        row.prefillTokenPrefix += contextTokens;
+        row.prefillBlockLevel += contextTokens;
+      } else {
         const warm = Math.max(0, request.appendedTokens);
         row.prefillTokenPrefix += warm;
         row.prefillBlockLevel += warm;
@@ -992,6 +1647,8 @@ export function totalRows(sessions: readonly SessionReplay[]): PolicyRow[] {
       total.applies.boundary += row.applies.boundary;
       total.applies.threshold += row.applies.threshold;
       total.appliesTotal += row.appliesTotal;
+      total.cutFallbacks += row.cutFallbacks;
+      total.cutUnavailable += row.cutUnavailable;
       total.thresholdCrossings += row.thresholdCrossings;
       total.jobsStarted += row.jobsStarted;
       total.coldMisses += row.coldMisses;
@@ -1021,6 +1678,8 @@ function markdownRow(sessionHash: string, row: PolicyRow): string {
     row.applies.boundary,
     row.applies.threshold,
     row.appliesTotal,
+    row.cutFallbacks,
+    row.cutUnavailable,
     row.thresholdCrossings,
     row.jobsStarted,
     row.coldMisses,
@@ -1055,10 +1714,10 @@ export function renderMarkdown(report: ReplayReport): string {
   lines.push(`- cache models: ${report.cacheModels.join(", ")}`);
   lines.push("");
   lines.push(
-    "| session | policy | cold | boundary | threshold | applies | threshold crossings | jobs started | cold misses | prefill token-prefix | prefill block-level (INFERRED) | apply re-read token-prefix | apply re-read block-level | summary start | summary end | summary max | summary written | notes appends | notes blocks left | consolidations | final context |",
+    "| session | policy | cold | boundary | threshold | applies | cut fallbacks | cuts unavailable | threshold crossings | jobs started | cold misses | prefill token-prefix | prefill block-level (INFERRED) | apply re-read token-prefix | apply re-read block-level | summary start | summary end | summary max | summary written | notes appends | notes blocks left | consolidations | final context |",
   );
   lines.push(
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
   );
   for (const session of report.sessions) {
     for (const row of session.policies) lines.push(markdownRow(session.hash, row));
@@ -1067,16 +1726,59 @@ export function renderMarkdown(report: ReplayReport): string {
   lines.push("## Totals");
   lines.push("");
   lines.push(
-    "| policy | cold | boundary | threshold | applies | threshold crossings | jobs started | cold misses | prefill token-prefix | prefill block-level (INFERRED) | summary written | notes appends | notes blocks left | consolidations |",
+    "| policy | cold | boundary | threshold | applies | cut fallbacks | cuts unavailable | threshold crossings | jobs started | cold misses | prefill token-prefix | prefill block-level (INFERRED) | summary written | notes appends | notes blocks left | consolidations |",
   );
   lines.push(
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
   );
   for (const row of report.totals) {
     lines.push(
-      `| ${row.policy} | ${row.applies.cold} | ${row.applies.boundary} | ${row.applies.threshold} | ${row.appliesTotal} | ${row.thresholdCrossings} | ${row.jobsStarted} | ${row.coldMisses} | ${row.prefillTokenPrefix} | ${row.prefillBlockLevel} | ${row.summaryWriteTokens} | ${row.notesAppends} | ${row.notesBlocks} | ${row.consolidations} |`,
+      `| ${row.policy} | ${row.applies.cold} | ${row.applies.boundary} | ${row.applies.threshold} | ${row.appliesTotal} | ${row.cutFallbacks} | ${row.cutUnavailable} | ${row.thresholdCrossings} | ${row.jobsStarted} | ${row.coldMisses} | ${row.prefillTokenPrefix} | ${row.prefillBlockLevel} | ${row.summaryWriteTokens} | ${row.notesAppends} | ${row.notesBlocks} | ${row.consolidations} |`,
     );
   }
+  lines.push("");
+  lines.push("## Default decision input");
+  lines.push("");
+  const rewrite = report.totals.find((row) => row.policy === "early-rewrite");
+  const notes = report.totals.find((row) => row.policy === "early-notes");
+  if (rewrite && notes) {
+    const deltaPrefix = notes.prefillTokenPrefix - rewrite.prefillTokenPrefix;
+    const deltaBlock = notes.prefillBlockLevel - rewrite.prefillBlockLevel;
+    const pct = (delta: number, base: number): string =>
+      base > 0 ? `${((delta / base) * 100).toFixed(2)}%` : "n/a";
+    lines.push(
+      `- notes vs rewrite total prefill delta (token-prefix): ${deltaPrefix >= 0 ? "+" : ""}${deltaPrefix} (${pct(deltaPrefix, rewrite.prefillTokenPrefix)} of rewrite)`,
+    );
+    lines.push(
+      `- notes vs rewrite total prefill delta (block-level, INFERRED): ${deltaBlock >= 0 ? "+" : ""}${deltaBlock} (${pct(deltaBlock, rewrite.prefillBlockLevel)} of rewrite)`,
+    );
+    lines.push(
+      `- notes consolidation frequency: ${notes.consolidations} rewrite-consolidate applies among ${notes.appliesTotal} notes applies; consolidation fires when the summary reaches 8192 tokens or 4 notes blocks (DEFAULTS).`,
+    );
+  } else {
+    lines.push("- notes and rewrite totals unavailable");
+  }
+  lines.push("");
+  lines.push("## Model assumptions");
+  lines.push("");
+  lines.push(
+    "- mod applies are evaluated only at a recorded run end (`stopReason` `stop`); a `toolUse` turn can prepare a READY job but never apply, and it is never a boundary. Stock uses the recorded compaction entries as its baseline when the recording carries branch identities; synthetic callers without identities fall back to the threshold simulation.",
+  );
+  lines.push(
+    "- jobs are immediately READY at the request that starts them; cooldowns, breaker state, spend caps beyond the start-time window and generation latency are not modelled (caps inside `shouldStartJob` are).",
+  );
+  lines.push(
+    "- a recorded compaction resets the simulated context at the following request; `cut fallbacks` counts evaluations that had no entry identity; `cuts unavailable` counts evaluations where prepareSource found nothing to summarize.",
+  );
+  lines.push(
+    "- cuts use `src/prepare.ts` (`prepareSource` -> `findCutPoint`) on identity-preserving entry stubs with the recorded whole-message, tool-tail, split-turn and keep-recent semantics; stub token counts are measured on the original messages.",
+  );
+  lines.push(
+    "- every mod apply is decided by the shared `applyDecision`; inputs are site `agent_settled`, `idle=true`, `hasPendingMessages=false`, `compacting=false`, `anchorValid=true`, `fingerprintValid=true`, permission open at the settled request, `runEnd` normal, and the recorded assistant `stopReason`.",
+  );
+  lines.push(
+    "- prefill includes the initial cold request for every policy. Local-model eviction and Anthropic block-level caching are INFERRED from recorded timestamps/usage, not measured here.",
+  );
   lines.push("");
   lines.push("## Skipped");
   lines.push("");
@@ -1274,6 +1976,7 @@ async function main(): Promise<number> {
           contextWindowFor: (provider, modelId) => meta.windowFor(provider, modelId),
           coldAt: (index) => coldFlags[index] === true,
           recordedSummaryTokens,
+          branch: session.branch,
         }),
       );
 
@@ -1348,6 +2051,7 @@ async function main(): Promise<number> {
     }
     tempRemoved = !existsSync(tempDir);
     print(`REPLAY_TEMP_DIR_REMOVED=${tempRemoved}`);
+    print(`REPLAY_TEMP_DIR_REMOVED_PATH=${resolvedTemp}`);
   }
 
   if (!report) return 1;
