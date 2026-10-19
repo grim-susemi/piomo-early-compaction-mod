@@ -18,7 +18,10 @@ notes total to the median rewrite total. Both agree.
 
 - Replay (todo 15): `reports/replay-2026-10-19.json`,
   `reports/replay-2026-10-19.md`; 5 sessions replayed over a 14-day window;
-  stock 176 applies, early-rewrite 388 applies, early-notes 390 applies.
+  stock 176 applies, early-rewrite 390 applies, early-notes 392 applies.
+  Prefill charges the first recorded request in full in both cache models for
+  every policy, even when a compaction applies at it; the post-apply context
+  is charged on the following request.
 - Real-model run (todo 16):
   `.omo/evidence/overlay-early-compaction-mod/task-16-overlay-early-compaction-mod.json`;
   2 calls on `ollama/deepseek-v4.1-flash`, both succeeded.
@@ -32,7 +35,7 @@ Anthropic model and is INFERRED, not measured here.
 
 | session | notes prefill (token-prefix) | rewrite prefill (token-prefix) | delta | notes prefill (block-level, INFERRED) | rewrite prefill (block-level, INFERRED) | delta | notes applies | consolidations |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 649ef8033436 | 28,122,382 | 28,097,701 | +0.09% | 14,757,505 | 14,777,779 | -0.14% | 62 | 23 |
+| 649ef8033436 | 28,565,085 | 28,527,198 | +0.13% | 14,868,481 | 14,889,359 | -0.14% | 64 | 24 |
 | 0a8240306866 | 35,600,692 | 34,423,894 | +3.42% | 16,133,644 | 15,965,063 | +1.06% | 122 | 40 |
 | d4a88b07e98d | 22,437,609 | 22,228,985 | +0.94% | 10,195,441 | 10,198,248 | -0.03% | 56 | 14 |
 | 2052a6a355d8 | 24,641,480 | 24,305,359 | +1.38% | 11,021,629 | 10,971,433 | +0.46% | 83 | 34 |
@@ -74,7 +77,7 @@ as the switchable alternative.
 ## Observed caveats
 
 - Consolidation frequency. The specified 0.08 x span notes size grows the
-  running summary quickly: 139 of 390 notes applies (35.6%) were
+  running summary quickly: 140 of 392 notes applies (35.7%) were
   `rewrite-consolidate`, and the final summary retains only one notes block in
   total across the five sessions. After roughly 1-2 appends the 8,192-token
   consolidation floor (or the 4-block cap) is reached, so notes mode
@@ -97,3 +100,11 @@ as the switchable alternative.
   them; generation latency, cooldowns beyond the start-time caps, and breaker
   state are not modelled. These assumptions are stated in the replay report
   and apply equally to both early policies.
+
+## Superseded figures
+
+Superseded (pre-fix replay, not used): early-notes 132,233,856 token-prefix /
+62,276,637 block-level versus early-rewrite 130,488,093 / 62,058,938, or
++1.34% / +0.35%, with 139 consolidations. That run omitted the first cold
+request when it triggered or coincided with an apply. The regenerated replay
+above replaces those figures.

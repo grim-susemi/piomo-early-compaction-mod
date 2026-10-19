@@ -13,8 +13,10 @@
  * `findCutPoint`) over identity-preserving branch entry stubs, so whole-message,
  * tool-tail, split-turn and keep-recent semantics are the production ones.
  * Recorded compactions reset the simulated context at the following request;
- * for stock they are the baseline applies. Total prefill includes the initial
- * cold request for every policy. The size model is:
+ * for stock they are the baseline applies. Total prefill charges the first
+ * recorded request in full for every policy even when a compaction applies at
+ * it; the post-apply context is charged on the following request. The size
+ * model is:
  *   notes   = 0.08 * span tokens (the appended block)
  *   rewrite = median of the summary token counts recorded in the same session
  *             (fallback 0.10 * span when the session has no compaction)
@@ -1237,6 +1239,10 @@ export function simulatePolicy(
   let jobReady = false;
   const startTimes: number[] = [];
   let aboveThreshold = false;
+  // Set when an apply lands on the first recorded request. That request is
+  // always charged as a full cold prefill; the compacted context it produces
+  // is paid by the next request instead.
+  let pendingApplyReread: { tokenPrefix: number; blockLevel: number } | null = null;
 
   for (let i = 0; i < requests.length; i++) {
     const request = requests[i];
@@ -1267,8 +1273,20 @@ export function simulatePolicy(
       appliedBase = contextTokens;
       hasCompaction = true;
       summary = resyncCompaction!.summaryTokens ?? summary;
+      row.summaryMaxTokens = Math.max(row.summaryMaxTokens, summary);
       notesBlocks = 0;
       aboveThreshold = false;
+    }
+
+    // A pending re-read from an apply on the first request is paid here. A
+    // cold request already charges its whole prompt, and a recorded compaction
+    // resets the context, so neither case adds the pending amount again.
+    if (pendingApplyReread) {
+      if (!resync && !options.coldAt(i)) {
+        row.prefillTokenPrefix += pendingApplyReread.tokenPrefix;
+        row.prefillBlockLevel += pendingApplyReread.blockLevel;
+      }
+      pendingApplyReread = null;
     }
 
     if (resync && options.policy === "stock" && branchIndex) {
@@ -1285,8 +1303,17 @@ export function simulatePolicy(
       summary = resyncCompaction!.summaryTokens ?? summary;
       row.applyRereadTokenPrefix += contextTokens;
       row.applyRereadBlockLevel += summary;
-      row.prefillTokenPrefix += contextTokens;
-      row.prefillBlockLevel += summary;
+      if (options.coldAt(i)) {
+        // A cold request re-reads the whole post-compaction prompt in both
+        // cache models; the written summary block alone would undercount it.
+        row.coldMisses += 1;
+        row.coldMissTokens += contextTokens;
+        row.prefillTokenPrefix += contextTokens;
+        row.prefillBlockLevel += contextTokens;
+      } else {
+        row.prefillTokenPrefix += contextTokens;
+        row.prefillBlockLevel += summary;
+      }
       contextAfterRequest = contextTokens;
       continue;
     }
@@ -1487,19 +1514,31 @@ export function simulatePolicy(
       row.summaryMaxTokens = Math.max(row.summaryMaxTokens, summary);
       row.applyRereadTokenPrefix += applyAfter;
       row.applyRereadBlockLevel += written;
-      row.prefillTokenPrefix += applyAfter;
-      row.prefillBlockLevel += written;
-      contextAfterRequest = applyAfter;
-      aboveThreshold = applyAfter >= threshold;
-    } else {
       if (i === 0) {
-        // The initial request is a cold request for every policy; it belongs
-        // to both prefill totals even when no compaction applies there.
+        // The first recorded request is a cold prefill in both models for
+        // every policy, independent of an apply decided at it. The compacted
+        // context it produces is charged on the following request.
         row.coldMisses += 1;
         row.coldMissTokens += contextTokens;
         row.prefillTokenPrefix += contextTokens;
         row.prefillBlockLevel += contextTokens;
+        pendingApplyReread = { tokenPrefix: applyAfter, blockLevel: written };
       } else if (options.coldAt(i)) {
+        // A cold request that also applies pays its own full prompt first;
+        // the post-apply context is the following request's re-read.
+        row.coldMisses += 1;
+        row.coldMissTokens += contextTokens;
+        row.prefillTokenPrefix += contextTokens + applyAfter;
+        row.prefillBlockLevel += contextTokens + written;
+      } else {
+        row.prefillTokenPrefix += applyAfter;
+        row.prefillBlockLevel += written;
+      }
+      contextAfterRequest = applyAfter;
+      aboveThreshold = applyAfter >= threshold;
+    } else {
+      if (i === 0 || options.coldAt(i)) {
+        // The first recorded request is always cold, whatever coldAt says.
         row.coldMisses += 1;
         row.coldMissTokens += contextTokens;
         row.prefillTokenPrefix += contextTokens;
@@ -1777,7 +1816,7 @@ export function renderMarkdown(report: ReplayReport): string {
     "- every mod apply is decided by the shared `applyDecision`; inputs are site `agent_settled`, `idle=true`, `hasPendingMessages=false`, `compacting=false`, `anchorValid=true`, `fingerprintValid=true`, permission open at the settled request, `runEnd` normal, and the recorded assistant `stopReason`.",
   );
   lines.push(
-    "- prefill includes the initial cold request for every policy. Local-model eviction and Anthropic block-level caching are INFERRED from recorded timestamps/usage, not measured here.",
+    "- prefill charges the first recorded request as a full cold request in both models for every policy, even when a compaction applies at that request; the post-apply context is charged on the following request. Local-model eviction and Anthropic block-level caching are INFERRED from recorded timestamps/usage, not measured here.",
   );
   lines.push("");
   lines.push("## Skipped");

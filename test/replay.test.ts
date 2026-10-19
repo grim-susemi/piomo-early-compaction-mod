@@ -10,6 +10,7 @@ import {
   scanForCopiedText,
   simulatePolicy,
   spanTokensFor,
+  type ReplayBranch,
   type ReplayRequest,
 } from "../qa/replay";
 
@@ -102,8 +103,10 @@ describe("replay policy rows", () => {
     expect(row.cutFallbacks).toBe(3);
     expect(row.thresholdCrossings).toBe(1);
     expect(row.jobsStarted).toBe(3);
-    expect(row.prefillTokenPrefix).toBe(128_000);
-    expect(row.prefillBlockLevel).toBe(68_000);
+    // Index 0 pays 50,000; the applies at 1 and 3 pay 26,000 each; the cold
+    // apply at index 2 pays its own 40,000 prompt plus the 26,000 re-read.
+    expect(row.prefillTokenPrefix).toBe(168_000);
+    expect(row.prefillBlockLevel).toBe(108_000);
     expect(row.summaryEndTokens).toBe(6_000);
     expect(row.summaryWriteTokens).toBe(18_000);
     expect(row.notesBlocks).toBe(0);
@@ -118,8 +121,10 @@ describe("replay policy rows", () => {
     expect(row.cutFallbacks).toBe(3);
     expect(row.thresholdCrossings).toBe(1);
     expect(row.jobsStarted).toBe(3);
-    expect(row.prefillTokenPrefix).toBe(133_408);
-    expect(row.prefillBlockLevel).toBe(59_808);
+    // Same 40,000 cold prompt at index 2 as the rewrite row; the appended
+    // notes blocks still add 1,600 and 2,208 tokens.
+    expect(row.prefillTokenPrefix).toBe(173_408);
+    expect(row.prefillBlockLevel).toBe(99_808);
     expect(row.summaryEndTokens).toBe(9_808);
     expect(row.summaryMaxTokens).toBe(9_808);
     expect(row.summaryWriteTokens).toBe(9_808);
@@ -172,6 +177,179 @@ describe("replay policy rows", () => {
     expect(stock.appliesTotal).toBe(0);
     expect(stock.prefillTokenPrefix).toBe(40_000);
     expect(stock.prefillBlockLevel).toBe(40_000);
+  });
+
+  const compactionAtZero: ReplayBranch = {
+    edits: [],
+    entries: [
+      {
+        index: 0,
+        id: "c0",
+        parentId: null,
+        timestamp: 0,
+        type: "compaction",
+        tokens: 0,
+        summaryTokens: 5_000,
+        firstKeptEntryId: "m1",
+      },
+      { index: 1, id: "m1", parentId: "c0", timestamp: 0, type: "message", role: "user", tokens: 1_000 },
+      {
+        index: 2,
+        id: "m2",
+        parentId: "m1",
+        timestamp: 0,
+        type: "message",
+        role: "assistant",
+        stopReason: "stop",
+        tokens: 1_000,
+      },
+    ],
+  };
+
+  const compactionAtOne: ReplayBranch = {
+    edits: [],
+    entries: [
+      {
+        index: 0,
+        id: "a0",
+        parentId: null,
+        timestamp: 0,
+        type: "message",
+        role: "assistant",
+        stopReason: "stop",
+        tokens: 20_000,
+      },
+      {
+        index: 1,
+        id: "c1",
+        parentId: "a0",
+        timestamp: 0,
+        type: "compaction",
+        tokens: 0,
+        summaryTokens: 5_000,
+        firstKeptEntryId: "a0",
+      },
+    ],
+  };
+
+  interface PrefillCase {
+    name: string;
+    requests: ReplayRequest[];
+    coldAt: (index: number) => boolean;
+    branch?: ReplayBranch;
+    expected: {
+      prefillTokenPrefix: number;
+      prefillBlockLevel: number;
+      coldMisses: number;
+      coldMissTokens: number;
+      thresholdApplies?: number;
+    };
+  }
+
+  // Every expectation below is hand-computed for a 100,000-token window:
+  // T = 60,000 (base ratio 0.6), effective keep-recent = 20,000, and a
+  // recorded summary of 5,000 tokens. A threshold apply on context C removes
+  // C - 20,000 and leaves 20,000 + 5,000 = 25,000 tokens.
+  const prefillCases: PrefillCase[] = [
+    {
+      name: "no apply",
+      requests: [request(1_000_000, 30_000, 0), request(1_060_000, 35_000, 5_000)],
+      coldAt: () => false,
+      expected: { prefillTokenPrefix: 35_000, prefillBlockLevel: 35_000, coldMisses: 1, coldMissTokens: 30_000, thresholdApplies: 0 },
+    },
+    {
+      name: "apply at index 0",
+      requests: [request(1_000_000, 80_000, 0)],
+      coldAt: () => false,
+      expected: { prefillTokenPrefix: 80_000, prefillBlockLevel: 80_000, coldMisses: 1, coldMissTokens: 80_000, thresholdApplies: 1 },
+    },
+    {
+      name: "apply at index 0, post-apply context on the next request",
+      requests: [request(1_000_000, 80_000, 0), request(1_060_000, 35_000, 10_000)],
+      coldAt: () => false,
+      expected: { prefillTokenPrefix: 115_000, prefillBlockLevel: 95_000, coldMisses: 1, coldMissTokens: 80_000, thresholdApplies: 1 },
+    },
+    {
+      name: "apply at index 1",
+      requests: [request(1_000_000, 30_000, 0), request(1_060_000, 65_000, 35_000)],
+      coldAt: () => false,
+      expected: { prefillTokenPrefix: 55_000, prefillBlockLevel: 35_000, coldMisses: 1, coldMissTokens: 30_000, thresholdApplies: 1 },
+    },
+    {
+      name: "cold request that also applies at index 1",
+      requests: [request(1_000_000, 30_000, 0), request(1_060_000, 65_000, 35_000)],
+      coldAt: (index) => index === 1,
+      expected: { prefillTokenPrefix: 120_000, prefillBlockLevel: 100_000, coldMisses: 2, coldMissTokens: 95_000, thresholdApplies: 1 },
+    },
+    {
+      name: "recorded builtin compaction at index 0",
+      requests: [request(1_000_000, 50_000, 0, { entryIndex: 2 })],
+      coldAt: () => false,
+      branch: compactionAtZero,
+      expected: { prefillTokenPrefix: 50_000, prefillBlockLevel: 50_000, coldMisses: 1, coldMissTokens: 50_000 },
+    },
+    {
+      name: "recorded compaction resync on a cold request",
+      requests: [
+        request(1_000_000, 30_000, 0, { entryIndex: 0 }),
+        request(1_060_000, 40_000, 0, { entryIndex: 1 }),
+      ],
+      coldAt: (index) => index === 1,
+      branch: compactionAtOne,
+      expected: { prefillTokenPrefix: 70_000, prefillBlockLevel: 70_000, coldMisses: 2, coldMissTokens: 70_000 },
+    },
+    {
+      name: "cold flag at index 0",
+      requests: [request(1_000_000, 30_000, 0), request(1_060_000, 35_000, 5_000)],
+      coldAt: (index) => index === 0,
+      expected: { prefillTokenPrefix: 35_000, prefillBlockLevel: 35_000, coldMisses: 1, coldMissTokens: 30_000, thresholdApplies: 0 },
+    },
+    {
+      name: "toolUse stopReason at index 0",
+      requests: [request(1_000_000, 80_000, 0, { stopReason: "toolUse" })],
+      coldAt: () => false,
+      expected: { prefillTokenPrefix: 80_000, prefillBlockLevel: 80_000, coldMisses: 1, coldMissTokens: 80_000, thresholdApplies: 0 },
+    },
+  ];
+
+  for (const policy of ["stock", "early-rewrite", "early-notes"] as const) {
+    for (const scenario of prefillCases) {
+      test(`${policy}: ${scenario.name}`, () => {
+        const row = simulatePolicy(scenario.requests, {
+          policy,
+          contextWindowFor: () => 100_000,
+          coldAt: scenario.coldAt,
+          recordedSummaryTokens: [5_000],
+          branch: scenario.branch,
+        });
+        expect(row.prefillTokenPrefix).toBe(scenario.expected.prefillTokenPrefix);
+        expect(row.prefillBlockLevel).toBe(scenario.expected.prefillBlockLevel);
+        expect(row.coldMisses).toBe(scenario.expected.coldMisses);
+        expect(row.coldMissTokens).toBe(scenario.expected.coldMissTokens);
+        if (scenario.expected.thresholdApplies !== undefined) {
+          expect(row.applies.threshold).toBe(scenario.expected.thresholdApplies);
+          expect(row.appliesTotal).toBe(scenario.expected.thresholdApplies);
+        }
+      });
+    }
+  }
+
+  test("a recorded compaction resync updates the summary maximum", () => {
+    const row = simulatePolicy(
+      [
+        request(1_000_000, 30_000, 0, { entryIndex: 0 }),
+        request(1_060_000, 40_000, 0, { entryIndex: 1 }),
+      ],
+      {
+        policy: "early-rewrite",
+        contextWindowFor: () => 100_000,
+        coldAt: () => false,
+        recordedSummaryTokens: [5_000],
+        branch: compactionAtOne,
+      },
+    );
+    expect(row.summaryEndTokens).toBe(5_000);
+    expect(row.summaryMaxTokens).toBe(5_000);
   });
 
   test("the structural cut wins over scalar keep-recent subtraction", () => {
