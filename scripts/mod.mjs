@@ -177,9 +177,37 @@ function isInside(root, target) {
   );
 }
 
+/**
+ * Normalize a Windows path spelling for comparison. Extended-length prefixes
+ * are stripped, and a local UNC spelling of a drive is mapped back to the
+ * drive letter. The result is used only for comparison, never for writes.
+ * @param {string} file
+ */
+function comparisonPath(file) {
+  let value = resolve(file);
+  if (process.platform !== "win32") return value;
+  const lower = value.toLowerCase();
+  if (lower.startsWith("\\\\?\\unc\\")) {
+    value = `\\\\${value.slice(8)}`;
+  } else if (lower.startsWith("\\\\?\\")) {
+    value = value.slice(4);
+  }
+  const unc = /^\\\\([^\\]+)\\([A-Za-z])\$(?=\\|$)/.exec(value);
+  const machine = (process.env.COMPUTERNAME ?? "").toLowerCase();
+  if (
+    unc !== null &&
+    (unc[1].toLowerCase() === "localhost" ||
+      unc[1] === "127.0.0.1" ||
+      (machine !== "" && unc[1].toLowerCase() === machine))
+  ) {
+    value = `${unc[2].toUpperCase()}:${value.slice(unc[0].length)}`;
+  }
+  return value;
+}
+
 /** Resolve a path for comparison; Windows paths compare case-insensitively. */
 function foldPath(file) {
-  const absolute = resolve(file);
+  const absolute = comparisonPath(file);
   return process.platform === "win32" ? absolute.toLowerCase() : absolute;
 }
 
@@ -195,10 +223,11 @@ function isInsideFolded(root, target) {
 }
 
 /**
- * Resolve an output path through the real path of its nearest existing
- * ancestor, so a symlinked parent cannot redirect the write. Returns the
- * resolved leaf for paths that exist, and null when the leaf exists but its
- * nearest real ancestor is not a directory (so no write could succeed).
+ * Resolve an output path through the native real path of its nearest existing
+ * ancestor. Native realpath expands 8.3 short names and junctions; the JS
+ * implementation retains short names, which made an aliased settings.json
+ * look like an unrelated file. Null means the path exists but cannot be
+ * resolved, or that a non-directory ancestor blocks it.
  * @param {string} file
  */
 function canonicalOutputPath(file) {
@@ -209,10 +238,19 @@ function canonicalOutputPath(file) {
   for (;;) {
     let real;
     try {
-      real = realpathSync(current);
+      real = realpathSync.native(current);
     } catch {
       const parent = dirname(current);
       if (parent === current) return absolute;
+      try {
+        // The leaf exists but realpath cannot resolve it (for example, a
+        // dangling symlink). Refuse rather than guess. ENOENT means it is
+        // simply missing, so continue with the parent.
+        lstatSync(current);
+        return null;
+      } catch {
+        // Missing: walk up to the nearest existing ancestor.
+      }
       tail.push(basename(current));
       current = parent;
       continue;
@@ -227,54 +265,216 @@ function canonicalOutputPath(file) {
   }
 }
 
+/** `${dev}:${ino}` for an existing path, else null. */
+function fileIdentity(file) {
+  try {
+    const info = statSync(file, { bigint: true });
+    return `${info.dev}:${info.ino}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Collect every entry below `directory` without following links. */
+function collectFiles(directory, out) {
+  let entries;
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = join(directory, entry.name);
+    if (entry.isDirectory() && !entry.isSymbolicLink()) {
+      collectFiles(full, out);
+    } else {
+      out.push(full);
+    }
+  }
+}
+
+/**
+ * Identity set of every file this command manages or could clobber. File
+ * identity, unlike a path string, also detects hardlinks and aliases.
+ * @param {string} root
+ */
+function managedIdentities(root) {
+  const stateDir = join(root, STATE_DIR);
+  const files = [
+    join(root, "settings.json"),
+    join(stateDir, "config.json"),
+    join(stateDir, "qualified.json"),
+  ];
+  try {
+    for (const entry of readdirSync(stateDir, { withFileTypes: true })) {
+      if (METRICS_PATTERN.test(entry.name)) {
+        files.push(join(stateDir, entry.name));
+      }
+    }
+  } catch {
+    // The state dir need not exist.
+  }
+  collectFiles(join(stateDir, "parked"), files);
+  collectFiles(join(root, "extensions"), files);
+  const identities = new Set();
+  for (const file of files) {
+    const identity = fileIdentity(file);
+    if (identity !== null) identities.add(identity);
+  }
+  return identities;
+}
+
+/**
+ * Reject Windows spellings that bypass the case-folded comparison: Win32
+ * normalizes names ending in a dot or space, and a colon after the drive
+ * letter denotes an NTFS alternate data stream.
+ * @param {string} value
+ */
+function assertWindowsDestinationSpelling(value) {
+  if (process.platform !== "win32") return;
+  let remainder = value;
+  const lower = remainder.toLowerCase();
+  if (lower.startsWith("\\\\?\\unc\\")) remainder = remainder.slice(8);
+  else if (lower.startsWith("\\\\?\\")) remainder = remainder.slice(4);
+  if (/^[A-Za-z]:/.test(remainder)) remainder = remainder.slice(2);
+  if (remainder.includes(":")) {
+    throw usageError(
+      `--receipt-out must not use an NTFS alternate data stream: ${value}`,
+    );
+  }
+  for (const part of value.split(/[\\/]+/)) {
+    if (part === "" || part === "." || part === "..") continue;
+    if (
+      /^[A-Za-z]:$/.test(part) ||
+      part === "?" ||
+      part.toLowerCase() === "unc"
+    ) {
+      continue;
+    }
+    if (part.endsWith(".") || part.endsWith(" ")) {
+      throw usageError(
+        `--receipt-out must not contain a name ending in a dot or space: ${value}`,
+      );
+    }
+  }
+}
+
+/**
+ * Map `target` into the agent's canonical spelling when it is reachable
+ * through a junction, short name, drive substitution or UNC alias. Detection
+ * is by dev+ino identity of an ancestor, not by spelling.
+ * @param {string} target @param {string} realRoot @param {string} realState
+ * @param {string} rootIdentity @param {string | null} stateIdentity
+ */
+function mapThroughAgentAliases(
+  target,
+  realRoot,
+  realState,
+  rootIdentity,
+  stateIdentity,
+) {
+  let current = target;
+  /** @type {string[]} */
+  const suffix = [];
+  for (;;) {
+    const identity = fileIdentity(current);
+    if (identity !== null && identity === rootIdentity) {
+      return join(realRoot, ...suffix.slice().reverse());
+    }
+    if (
+      identity !== null &&
+      stateIdentity !== null &&
+      identity === stateIdentity
+    ) {
+      return join(realState, ...suffix.slice().reverse());
+    }
+    const parent = dirname(current);
+    if (parent === current) return null;
+    suffix.push(basename(current));
+    current = parent;
+  }
+}
+
 /**
  * Validate an output destination before any command writes or removes
- * anything. An output may live outside the agent dir, or under the mod's own
- * early-compaction/ state dir, but never at settings.json (any case, any
- * location), inside extensions/, at a managed file, or at a directory.
+ * anything. Identity decides: an existing destination that is settings.json,
+ * any other managed file, or a hardlink to one is rejected even through an
+ * 8.3 alias, junction or alternate spelling. An output may live outside the
+ * agent dir, or under the mod's own early-compaction/ state dir, but never
+ * inside the agent dir elsewhere.
  * @param {string} root @param {string} value
  */
 function validateOutputPath(root, value) {
   if (!isAbsolute(value)) {
     throw usageError("--receipt-out must be an absolute path");
   }
+  assertWindowsDestinationSpelling(value);
   const target = canonicalOutputPath(value);
   if (target === null) {
     throw usageError(
       `--receipt-out cannot be resolved to a file path: ${value}`,
     );
   }
-  if (basename(target).toLowerCase() === "settings.json") {
+  // No settings.json anywhere: another agent dir's settings file is not
+  // managed by this command, but it must still never be replaced. This is
+  // kept in addition to the identity checks below.
+  if (
+    basename(value).toLowerCase() === "settings.json" ||
+    basename(target).toLowerCase() === "settings.json"
+  ) {
     throw usageError(
       `--receipt-out must not point at settings.json (any case): ${value}`,
     );
   }
-  let existing;
+  let targetInfo;
   try {
-    existing = statSync(target);
+    targetInfo = statSync(target, { bigint: true });
   } catch {
-    existing = undefined;
+    targetInfo = undefined;
   }
-  if (existing !== undefined && !existing.isFile()) {
+  if (targetInfo !== undefined && !targetInfo.isFile()) {
     throw usageError(
       `--receipt-out must be a file path, not a directory: ${value}`,
     );
   }
+  if (
+    targetInfo !== undefined &&
+    managedIdentities(root).has(`${targetInfo.dev}:${targetInfo.ino}`)
+  ) {
+    throw usageError(
+      `--receipt-out must not overwrite a file the command manages: ${value}`,
+    );
+  }
 
   const realRoot = canonicalOutputPath(root);
-  if (realRoot === null || !isInsideFolded(realRoot, target)) {
+  if (realRoot === null) {
+    throw usageError(`agent dir cannot be resolved: ${root}`);
+  }
+  const realState = join(realRoot, STATE_DIR);
+  const rootIdentity = fileIdentity(realRoot);
+  const mapped =
+    rootIdentity === null
+      ? null
+      : mapThroughAgentAliases(
+          target,
+          realRoot,
+          realState,
+          rootIdentity,
+          fileIdentity(realState),
+        );
+  const checked = mapped ?? target;
+  if (!isInsideFolded(realRoot, checked)) {
     return target;
   }
-  const stateDir = join(realRoot, STATE_DIR);
   if (
-    foldPath(stateDir) === foldPath(target) ||
-    !isInsideFolded(stateDir, target)
+    foldPath(realState) === foldPath(checked) ||
+    !isInsideFolded(realState, checked)
   ) {
     throw usageError(
       `--receipt-out inside the agent dir must be under ${STATE_DIR}/: ${value}`,
     );
   }
-  const stateRel = relative(foldPath(stateDir), foldPath(target))
+  const stateRel = relative(foldPath(realState), foldPath(checked))
     .split(sep)
     .join("/");
   const top = stateRel.split("/")[0];
@@ -292,7 +492,7 @@ function validateOutputPath(root, value) {
       `--receipt-out must not overwrite a managed file: ${value}`,
     );
   }
-  if (existing !== undefined && top !== "receipts") {
+  if (targetInfo !== undefined && top !== "receipts") {
     throw usageError(
       `--receipt-out must not overwrite an existing file the command manages: ${value}`,
     );

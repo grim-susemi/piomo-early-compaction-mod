@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -78,6 +79,43 @@ function snapshot(root: string): Record<string, string> {
 
 function readJson(file: string): any {
   return JSON.parse(readFileSync(file, "utf8"));
+}
+
+const windowsOnly = test.skipIf(process.platform !== "win32");
+
+/** Real 8.3 short path as formatted by cmd.exe. */
+function shortPath(file: string): string {
+  return execSync(`for %I in ("${file}") do @echo %~sI`, {
+    encoding: "utf8",
+    shell: "cmd.exe",
+  }).trim();
+}
+
+/**
+ * Assert a receipt destination is rejected before anything is written or
+ * removed, regardless of how the destination names a protected file.
+ */
+function rejectReceipt(agent: string, receiptOut: string): void {
+  const settings = join(agent, "settings.json");
+  const beforeBytes = readFileSync(settings);
+  const beforeMtime = statSync(settings).mtimeMs;
+  const result = runCli([
+    "remove",
+    "--agent-dir",
+    agent,
+    "--receipt-out",
+    receiptOut,
+  ]);
+  expect(result.status, result.stderr).toBe(2);
+  expect(result.stderr).toContain("usage: bun scripts/mod.mjs");
+  expect(readFileSync(settings)).toEqual(beforeBytes);
+  expect(statSync(settings).mtimeMs).toBe(beforeMtime);
+  expect(existsSync(join(agent, "extensions", "early-compaction.js"))).toBe(
+    true,
+  );
+  expect(existsSync(join(agent, "early-compaction", "config.json"))).toBe(
+    true,
+  );
 }
 
 test("full lifecycle: install, status, off, on, mode, report, remove", () => {
@@ -435,23 +473,166 @@ test("remove rejects a receipt path at a foreign extension file", () => {
 
 test("remove rejects a case-variant settings.json receipt path", () => {
   const agent = tempAgent();
-  const settings = join(agent, "settings.json");
   const install = runCli(["install", "--agent-dir", agent]);
   expect(install.status, install.stderr).toBe(0);
-  const before = readFileSync(settings);
 
-  const result = runCli([
+  rejectReceipt(agent, join(agent, "Settings.JSON"));
+});
+
+test("remove rejects a non-existent settings.json outside the agent dir", () => {
+  const agent = tempAgent('{"sentinel":true}\n');
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+  const outside = mkdtempSync(join(tmpdir(), "early-compaction-outside-"));
+  temporaryDirs.push(outside);
+  const receiptOut = join(outside, "settings.json");
+
+  rejectReceipt(agent, receiptOut);
+  expect(existsSync(receiptOut)).toBe(false);
+});
+
+test(
+  "remove rejects an existing unrelated Settings.JSON outside the agent dir",
+  () => {
+    const agent = tempAgent('{"sentinel":true}\n');
+    const install = runCli(["install", "--agent-dir", agent]);
+    expect(install.status, install.stderr).toBe(0);
+    const outside = mkdtempSync(join(tmpdir(), "early-compaction-outside-"));
+    temporaryDirs.push(outside);
+    const receiptOut = join(outside, "Settings.JSON");
+    const bytes = '{"other-agent":true}\n';
+    writeFileSync(receiptOut, bytes);
+    const beforeMtime = statSync(receiptOut).mtimeMs;
+
+    rejectReceipt(agent, receiptOut);
+    expect(readFileSync(receiptOut, "utf8")).toBe(bytes);
+    expect(statSync(receiptOut).mtimeMs).toBe(beforeMtime);
+  },
+);
+
+test("remove rejects a sibling agent's settings.json", () => {
+  const agent = tempAgent('{"sentinel":true}\n');
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+  const sibling = tempAgent('{"sibling-agent":true}\n');
+  const siblingSettings = join(sibling, "settings.json");
+  const beforeBytes = readFileSync(siblingSettings);
+  const beforeMtime = statSync(siblingSettings).mtimeMs;
+
+  rejectReceipt(agent, siblingSettings);
+  expect(readFileSync(siblingSettings)).toEqual(beforeBytes);
+  expect(statSync(siblingSettings).mtimeMs).toBe(beforeMtime);
+});
+
+windowsOnly("remove rejects an 8.3 short-name alias of settings.json", () => {
+  const agent = tempAgent('{"sentinel":true}\n');
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+  const settings = join(agent, "settings.json");
+  const alias = shortPath(settings);
+  expect(alias.toLowerCase()).not.toBe(settings.toLowerCase());
+
+  rejectReceipt(agent, alias);
+});
+
+windowsOnly(
+  "remove rejects a receipt path through a junction into the agent dir",
+  () => {
+    const agent = tempAgent('{"sentinel":true}\n');
+    const install = runCli(["install", "--agent-dir", agent]);
+    expect(install.status, install.stderr).toBe(0);
+    const outside = mkdtempSync(join(tmpdir(), "early-compaction-junction-"));
+    temporaryDirs.push(outside);
+    const junction = join(outside, "agent-link");
+    const made = spawnSync(
+      "cmd.exe",
+      ["/d", "/c", "mklink", "/J", junction, agent],
+      { encoding: "utf8" },
+    );
+    expect(made.status, made.stderr).toBe(0);
+
+    rejectReceipt(agent, join(junction, "settings.json"));
+    // A missing destination through the junction still lands in the agent
+    // root, outside early-compaction/.
+    rejectReceipt(agent, join(junction, "new-receipt.json"));
+  },
+);
+
+windowsOnly(
+  "remove rejects a hardlink to settings.json outside the agent dir",
+  () => {
+    const agent = tempAgent('{"sentinel":true}\n');
+    const install = runCli(["install", "--agent-dir", agent]);
+    expect(install.status, install.stderr).toBe(0);
+    const outside = mkdtempSync(join(tmpdir(), "early-compaction-hardlink-"));
+    temporaryDirs.push(outside);
+    const link = join(outside, "settings-hardlink.json");
+    linkSync(join(agent, "settings.json"), link);
+
+    rejectReceipt(agent, link);
+  },
+);
+
+windowsOnly("remove rejects a receipt name ending in a dot", () => {
+  const agent = tempAgent('{"sentinel":true}\n');
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+  const outside = mkdtempSync(join(tmpdir(), "early-compaction-dot-"));
+  temporaryDirs.push(outside);
+  const receiptOut = join(outside, "receipt.");
+
+  rejectReceipt(agent, receiptOut);
+  expect(existsSync(receiptOut)).toBe(false);
+});
+
+windowsOnly("remove rejects an NTFS alternate-stream destination", () => {
+  const agent = tempAgent('{"sentinel":true}\n');
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+  const receiptOut = join(agent, "settings.json:evil");
+
+  rejectReceipt(agent, receiptOut);
+  expect(existsSync(receiptOut)).toBe(false);
+});
+
+windowsOnly(
+  "remove rejects extended-length and UNC spellings of settings.json",
+  () => {
+    const agent = tempAgent('{"sentinel":true}\n');
+    const install = runCli(["install", "--agent-dir", agent]);
+    expect(install.status, install.stderr).toBe(0);
+    const settings = join(agent, "settings.json");
+    const unc = "\\\\localhost\\" + settings[0] + "$\\" + settings.slice(2);
+    const extended = "\\\\?\\" + settings;
+    const extendedUnc =
+      "\\\\?\\UNC\\localhost\\" + settings[0] + "$\\" + settings.slice(2);
+
+    rejectReceipt(agent, extended);
+    rejectReceipt(agent, extendedUnc);
+    rejectReceipt(agent, unc);
+  },
+);
+
+test("remove writes a legitimate receipt under early-compaction/receipts", () => {
+  const agent = tempAgent();
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+  const receiptOut = join(
+    agent,
+    "early-compaction",
+    "receipts",
+    "removal.json",
+  );
+
+  const remove = runCli([
     "remove",
     "--agent-dir",
     agent,
     "--receipt-out",
-    join(agent, "Settings.JSON"),
+    receiptOut,
   ]);
-  expect(result.status).toBe(2);
-  expect(readFileSync(settings)).toEqual(before);
-  expect(existsSync(join(agent, "extensions", "early-compaction.js"))).toBe(
-    true,
-  );
+  expect(remove.status, remove.stderr).toBe(0);
+  expect(readJson(receiptOut).command).toBe("remove");
 });
 
 test("remove writes a legitimate receipt outside the agent dir", () => {
