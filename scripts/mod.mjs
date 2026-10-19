@@ -19,7 +19,7 @@
  *            qualified versions and residue. Exit 0 when clean, 1 otherwise.
  *   qualify  run `bun run qa:isolated`, then record VERSION,
  *            engineBuildIdentity().text and the five builtin file fingerprints
- *            in REPO qualified.json.
+ *            in REPO qualified.json; --dry-run only prints the plan.
  *   mode     atomically set config.json mode to notes or rewrite.
  *   report   read-only, numbers-only join of metrics.jsonl and the builtin
  *            compaction log.
@@ -837,8 +837,21 @@ function locateSenpi() {
 
 /** @param {ReturnType<typeof parseArgs>} parsed */
 async function qualify(parsed) {
-  const { root } = context(parsed);
+  const { root, options } = context(parsed);
   const guard = settingsGuard(root);
+  const target = process.env.PIOMO_MOD_QUALIFIED_PATH
+    ? resolve(process.env.PIOMO_MOD_QUALIFIED_PATH)
+    : join(REPO, "qualified.json");
+
+  if (options.dryRun) {
+    console.log(`qualify: dry-run agent_dir=${root}`);
+    console.log("qualify: would run bun run qa:isolated");
+    console.log(
+      "qualify: would record the installed senpi VERSION, engine identity " +
+        `and ${QUALIFIED_FILES.length} builtin fingerprints in ${target}`,
+    );
+    return;
+  }
 
   const fakeQa = process.env.PIOMO_MOD_QA_COMMAND;
   const packageJson = readJson(join(REPO, "package.json"));
@@ -913,9 +926,6 @@ async function qualify(parsed) {
     fingerprints[file] = hash;
   }
 
-  const target = process.env.PIOMO_MOD_QUALIFIED_PATH
-    ? resolve(process.env.PIOMO_MOD_QUALIFIED_PATH)
-    : join(REPO, "qualified.json");
   let document = { schema: 1, versions: {} };
   if (existsSync(target)) {
     let parsed;

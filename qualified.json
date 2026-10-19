@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "versions": {
+    "2026.10.19": {
+      "identity": "2026.10.19",
+      "fingerprints": {
+        "prompts.js": "5bf074aea446baa51204f29ec00758a93a9cbfc89caa62ffe0a4078dcca0e6b3",
+        "task-intent.js": "3d78e7e232c172a57af0e919cf0b0b34c98282f235c2d400e4c0bba7f47d545d",
+        "policy.js": "b4963e20804082e1f8440644fa59a371bbe1d4786ec796fd8d2214cbfa2cce6d",
+        "idle.js": "a0314cb8c5fca54d50c4a1568be9cb6998c942284683e112a56703ded6361223",
+        "speculative.js": "99ac70e0088f2b66538b76c4b2acef5c13e5290e3e1645fea71b8a70c41799b4"
+      }
+    }
+  }
+}

@@ -265,6 +265,28 @@ test("--dry-run leaves the agent tree unchanged", () => {
   expect(snapshot(agent)).toEqual(before);
 });
 
+test("qualify --dry-run runs no QA and writes no qualified file", () => {
+  const agent = tempAgent();
+  const marker = join(agent, "qa-ran");
+  const hook = join(agent, "marker-qa.mjs");
+  writeFileSync(
+    hook,
+    `import { writeFileSync } from "node:fs";\n` +
+      `writeFileSync(${JSON.stringify(marker)}, "ran");\n`,
+  );
+  const qualifiedOut = join(agent, "qualified.json");
+  const before = snapshot(agent);
+  const result = runCli(["qualify", "--agent-dir", agent, "--dry-run"], {
+    PIOMO_MOD_QA_COMMAND: hook,
+    PIOMO_MOD_QUALIFIED_PATH: qualifiedOut,
+  });
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toContain("dry-run");
+  expect(existsSync(marker)).toBe(false);
+  expect(existsSync(qualifiedOut)).toBe(false);
+  expect(snapshot(agent)).toEqual(before);
+});
+
 test("missing or relative --agent-dir exits non-zero with a usage line", () => {
   const missing = runCli(["install"]);
   expect(missing.status).not.toBe(0);
