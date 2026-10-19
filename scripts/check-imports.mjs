@@ -41,19 +41,16 @@ function staticAndQuotedDynamic(clean) {
   return out;
 }
 
-// Template-literal dynamic imports: a substitution-free template is its plain
-// specifier. A template WITH substitutions fails when any literal chunk carries
-// an allowed-root-plus-slash prefix, or when the fixed head before the first
-// ${} is not a relative path, a node: builtin, or exactly an allowed root.
+// Template-literal dynamic imports, fail closed: a substitution-free template
+// is its plain specifier. A template WITH substitutions is allowed ONLY when
+// the fixed head before the first ${} starts with ./, ../, or node: — any
+// package-root head (even exactly an allowed root, whose substitution could
+// complete a deep path) or any other head is rejected.
 function checkTemplateBody(body) {
   const sub = body.indexOf("${");
   if (sub === -1) return isAllowed(body) ? null : body;
-  for (const root of ALLOWED_ROOTS) {
-    if (body.includes(root + "/")) return body;
-  }
   const head = body.slice(0, sub);
-  if (head.startsWith(".") || head.startsWith("node:")) return null;
-  if (ALLOWED_ROOTS.has(head)) return null;
+  if (head.startsWith("./") || head.startsWith("../") || head.startsWith("node:")) return null;
   return body;
 }
 
