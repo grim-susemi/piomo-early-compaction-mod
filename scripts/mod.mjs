@@ -46,6 +46,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -174,6 +175,129 @@ function isInside(root, target) {
       relPath !== ".." &&
       !isAbsolute(relPath))
   );
+}
+
+/** Resolve a path for comparison; Windows paths compare case-insensitively. */
+function foldPath(file) {
+  const absolute = resolve(file);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
+/** True when `target` is `root` or lies inside it, ignoring Windows case. */
+function isInsideFolded(root, target) {
+  const relPath = relative(foldPath(root), foldPath(target));
+  return (
+    relPath === "" ||
+    (!relPath.startsWith(`..${sep}`) &&
+      relPath !== ".." &&
+      !isAbsolute(relPath))
+  );
+}
+
+/**
+ * Resolve an output path through the real path of its nearest existing
+ * ancestor, so a symlinked parent cannot redirect the write. Returns the
+ * resolved leaf for paths that exist, and null when the leaf exists but its
+ * nearest real ancestor is not a directory (so no write could succeed).
+ * @param {string} file
+ */
+function canonicalOutputPath(file) {
+  const absolute = resolve(file);
+  /** @type {string[]} */
+  const tail = [];
+  let current = absolute;
+  for (;;) {
+    let real;
+    try {
+      real = realpathSync(current);
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return absolute;
+      tail.push(basename(current));
+      current = parent;
+      continue;
+    }
+    if (tail.length === 0) return real;
+    try {
+      if (!statSync(real).isDirectory()) return null;
+    } catch {
+      return null;
+    }
+    return join(real, ...tail.slice().reverse());
+  }
+}
+
+/**
+ * Validate an output destination before any command writes or removes
+ * anything. An output may live outside the agent dir, or under the mod's own
+ * early-compaction/ state dir, but never at settings.json (any case, any
+ * location), inside extensions/, at a managed file, or at a directory.
+ * @param {string} root @param {string} value
+ */
+function validateOutputPath(root, value) {
+  if (!isAbsolute(value)) {
+    throw usageError("--receipt-out must be an absolute path");
+  }
+  const target = canonicalOutputPath(value);
+  if (target === null) {
+    throw usageError(
+      `--receipt-out cannot be resolved to a file path: ${value}`,
+    );
+  }
+  if (basename(target).toLowerCase() === "settings.json") {
+    throw usageError(
+      `--receipt-out must not point at settings.json (any case): ${value}`,
+    );
+  }
+  let existing;
+  try {
+    existing = statSync(target);
+  } catch {
+    existing = undefined;
+  }
+  if (existing !== undefined && !existing.isFile()) {
+    throw usageError(
+      `--receipt-out must be a file path, not a directory: ${value}`,
+    );
+  }
+
+  const realRoot = canonicalOutputPath(root);
+  if (realRoot === null || !isInsideFolded(realRoot, target)) {
+    return target;
+  }
+  const stateDir = join(realRoot, STATE_DIR);
+  if (
+    foldPath(stateDir) === foldPath(target) ||
+    !isInsideFolded(stateDir, target)
+  ) {
+    throw usageError(
+      `--receipt-out inside the agent dir must be under ${STATE_DIR}/: ${value}`,
+    );
+  }
+  const stateRel = relative(foldPath(stateDir), foldPath(target))
+    .split(sep)
+    .join("/");
+  const top = stateRel.split("/")[0];
+  if (top === "parked") {
+    throw usageError(
+      `--receipt-out must not point into ${STATE_DIR}/parked/: ${value}`,
+    );
+  }
+  if (
+    top === "config.json" ||
+    top === "qualified.json" ||
+    METRICS_PATTERN.test(top)
+  ) {
+    throw usageError(
+      `--receipt-out must not overwrite a managed file: ${value}`,
+    );
+  }
+  if (existing !== undefined && top !== "receipts") {
+    throw usageError(
+      `--receipt-out must not overwrite an existing file the command manages: ${value}`,
+    );
+  }
+  return target;
 }
 
 /**
@@ -933,6 +1057,14 @@ async function main() {
   const root = resolve(parsed.options.agentDir);
   if (!existsSync(root) || !statSync(root).isDirectory()) {
     throw usageError(`agent dir does not exist: ${root}`);
+  }
+  // Every output option is checked here, before a command can build, write or
+  // remove anything. The post-command settings guard remains as a backstop.
+  if (parsed.options.receiptOut !== undefined) {
+    parsed.options.receiptOut = validateOutputPath(
+      root,
+      parsed.options.receiptOut,
+    );
   }
 
   switch (command) {
