@@ -80,12 +80,14 @@ describe("replay policy rows", () => {
     const row = simulate("stock");
     expect(row.applies).toEqual({ cold: 0, boundary: 0, threshold: 2 });
     expect(row.appliesTotal).toBe(2);
+    expect(row.cutFallbacks).toBe(2);
+    expect(row.cutUnavailable).toBe(0);
     expect(row.thresholdCrossings).toBe(2);
     expect(row.jobsStarted).toBe(0);
-    expect(row.coldMisses).toBe(1);
-    expect(row.coldMissTokens).toBe(40_000);
-    expect(row.prefillTokenPrefix).toBe(92_000);
-    expect(row.prefillBlockLevel).toBe(52_000);
+    expect(row.coldMisses).toBe(2);
+    expect(row.coldMissTokens).toBe(90_000);
+    expect(row.prefillTokenPrefix).toBe(142_000);
+    expect(row.prefillBlockLevel).toBe(102_000);
     expect(row.applyRereadTokenPrefix).toBe(52_000);
     expect(row.applyRereadBlockLevel).toBe(12_000);
     expect(row.summaryEndTokens).toBe(6_000);
@@ -97,10 +99,11 @@ describe("replay policy rows", () => {
     const row = simulate("early-rewrite");
     expect(row.applies).toEqual({ cold: 1, boundary: 1, threshold: 1 });
     expect(row.appliesTotal).toBe(3);
+    expect(row.cutFallbacks).toBe(3);
     expect(row.thresholdCrossings).toBe(1);
     expect(row.jobsStarted).toBe(3);
-    expect(row.prefillTokenPrefix).toBe(78_000);
-    expect(row.prefillBlockLevel).toBe(18_000);
+    expect(row.prefillTokenPrefix).toBe(128_000);
+    expect(row.prefillBlockLevel).toBe(68_000);
     expect(row.summaryEndTokens).toBe(6_000);
     expect(row.summaryWriteTokens).toBe(18_000);
     expect(row.notesBlocks).toBe(0);
@@ -112,10 +115,11 @@ describe("replay policy rows", () => {
     const row = simulate("early-notes");
     expect(row.applies).toEqual({ cold: 1, boundary: 1, threshold: 1 });
     expect(row.appliesTotal).toBe(3);
+    expect(row.cutFallbacks).toBe(3);
     expect(row.thresholdCrossings).toBe(1);
     expect(row.jobsStarted).toBe(3);
-    expect(row.prefillTokenPrefix).toBe(83_408);
-    expect(row.prefillBlockLevel).toBe(9_808);
+    expect(row.prefillTokenPrefix).toBe(133_408);
+    expect(row.prefillBlockLevel).toBe(59_808);
     expect(row.summaryEndTokens).toBe(9_808);
     expect(row.summaryMaxTokens).toBe(9_808);
     expect(row.summaryWriteTokens).toBe(9_808);
@@ -123,6 +127,111 @@ describe("replay policy rows", () => {
     expect(row.notesBlocks).toBe(2);
     expect(row.consolidations).toBe(0);
     expect(row.finalContextTokens).toBe(29_808);
+  });
+
+  test("a toolUse turn is not a task boundary", () => {
+    const toolUseRequests = [request(1_000_000, 20_000, 0, { stopReason: "toolUse" }), request(1_060_000, 40_000, 20_000, { stopReason: "toolUse" })];
+    const row = simulatePolicy(toolUseRequests, {
+      policy: "early-rewrite",
+      contextWindowFor: () => 100_000,
+      coldAt: () => false,
+      recordedSummaryTokens: [5_000],
+    });
+    expect(row.applies.boundary).toBe(0);
+    expect(row.appliesTotal).toBe(0);
+    // The same row with a normal stop is a boundary apply, so the assertion
+    // above cannot pass for an unrelated reason.
+    const stopRequests = [request(1_000_000, 20_000, 0), request(1_060_000, 40_000, 20_000)];
+    const stopRow = simulatePolicy(stopRequests, {
+      policy: "early-rewrite",
+      contextWindowFor: () => 100_000,
+      coldAt: () => false,
+      recordedSummaryTokens: [5_000],
+    });
+    expect(stopRow.applies.boundary).toBe(1);
+  });
+
+  test("the initial cold request is counted in both prefill models", () => {
+    const twoRequests = [request(1_000_000, 20_000, 0), request(1_060_000, 40_000, 20_000)];
+    const early = simulatePolicy(twoRequests, {
+      policy: "early-rewrite",
+      contextWindowFor: () => 100_000,
+      coldAt: () => false,
+      recordedSummaryTokens: [5_000],
+    });
+    expect(early.applies.boundary).toBe(1);
+    expect(early.prefillTokenPrefix).toBe(45_000);
+    expect(early.prefillBlockLevel).toBe(25_000);
+
+    const stock = simulatePolicy(twoRequests, {
+      policy: "stock",
+      contextWindowFor: () => 100_000,
+      coldAt: () => false,
+      recordedSummaryTokens: [5_000],
+    });
+    expect(stock.appliesTotal).toBe(0);
+    expect(stock.prefillTokenPrefix).toBe(40_000);
+    expect(stock.prefillBlockLevel).toBe(40_000);
+  });
+
+  test("the structural cut wins over scalar keep-recent subtraction", () => {
+    const header = JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "structural-cut-session",
+      timestamp: TIMESTAMP,
+      cwd: "/tmp",
+    });
+    const entry = (id: string, parentId: string | null, role: string, text: string, usage?: object): string =>
+      JSON.stringify({
+        type: "message",
+        id,
+        parentId,
+        timestamp: TIMESTAMP,
+        message: {
+          role,
+          content: [{ type: "text", text }],
+          ...(role === "assistant"
+            ? { stopReason: "stop", usage, provider: "test", model: "test-model" }
+            : {}),
+        },
+      });
+    const text = [
+      header,
+      entry("e1", null, "user", "ab ".repeat(40_000)),
+      entry("e2", "e1", "assistant", "ab ".repeat(40_000), { input: 90_000, output: 100 }),
+      entry("e3", "e2", "user", "ab ".repeat(40_000)),
+      entry("e4", "e3", "assistant", "ab ".repeat(13_333), { input: 30_000, output: 100 }),
+    ].join("\n");
+
+    const parsed = parseSessionText(text);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.session.requests.map((value) => value.entryIndex)).toEqual([1, 3]);
+    expect(parsed.session.branch.entries.length).toBe(4);
+
+    const options = {
+      contextWindowFor: () => 200_000,
+      coldAt: () => false,
+      recordedSummaryTokens: [],
+    } as const;
+    const structural = simulatePolicy(parsed.session.requests, {
+      ...options,
+      policy: "early-rewrite",
+      branch: parsed.session.branch,
+    });
+    const scalar = simulatePolicy(parsed.session.requests, { ...options, policy: "early-rewrite" });
+
+    // Kept tail: e3+e4 (40k tokens), so the structural span is e1+e2 = 60k,
+    // not the scalar 120100 - 20000 = 100100.
+    expect(structural.cutFallbacks).toBe(0);
+    expect(structural.cutUnavailable).toBe(0);
+    expect(structural.applies.boundary).toBe(1);
+    expect(structural.summaryWriteTokens).toBe(6_000);
+    expect(structural.finalContextTokens).toBe(66_100);
+    expect(scalar.cutFallbacks).toBe(1);
+    expect(scalar.summaryWriteTokens).toBe(10_010);
+    expect(structural.summaryWriteTokens).not.toBe(scalar.summaryWriteTokens);
   });
 });
 

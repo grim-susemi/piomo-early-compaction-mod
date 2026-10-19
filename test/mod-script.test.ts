@@ -335,6 +335,8 @@ test("qualify fails cleanly while qa:isolated does not exist", () => {
 
 test("remove leaves a foreign extension file untouched", () => {
   const agent = tempAgent();
+  const receiptDir = mkdtempSync(join(tmpdir(), "early-compaction-receipt-"));
+  temporaryDirs.push(receiptDir);
   const foreign = join(agent, "extensions", "other-mod.ts");
   writeFileSync(foreign, "export const x = 1;\n");
   const install = runCli(["install", "--agent-dir", agent]);
@@ -345,7 +347,7 @@ test("remove leaves a foreign extension file untouched", () => {
     existsSync(join(agent, "early-compaction", "parked", "early-compaction.js")),
   ).toBe(true);
 
-  const receiptOut = join(agent, "removal-receipt.json");
+  const receiptOut = join(receiptDir, "removal-receipt.json");
   const remove = runCli([
     "remove",
     "--agent-dir",
@@ -363,6 +365,93 @@ test("remove leaves a foreign extension file untouched", () => {
     existsSync(join(agent, "early-compaction", "parked", "early-compaction.js")),
   ).toBe(false);
   expect(existsSync(join(agent, "early-compaction"))).toBe(false);
+});
+
+test("remove rejects a receipt path at settings.json before removing anything", () => {
+  const agent = tempAgent('{"sentinel":true}\n');
+  const settings = join(agent, "settings.json");
+  const extension = join(agent, "extensions", "early-compaction.js");
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+  const before = readFileSync(settings);
+
+  const result = runCli([
+    "remove",
+    "--agent-dir",
+    agent,
+    "--receipt-out",
+    settings,
+  ]);
+  expect(result.status).toBe(2);
+  expect(result.stderr).toContain("usage: bun scripts/mod.mjs");
+  expect(readFileSync(settings)).toEqual(before);
+  expect(existsSync(extension)).toBe(true);
+  expect(existsSync(join(agent, "early-compaction", "config.json"))).toBe(true);
+});
+
+test("remove rejects a receipt path at a foreign extension file", () => {
+  const agent = tempAgent();
+  const foreign = join(agent, "extensions", "other-mod.ts");
+  const foreignBytes = "export const x = 1;\n";
+  writeFileSync(foreign, foreignBytes);
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+
+  const result = runCli([
+    "remove",
+    "--agent-dir",
+    agent,
+    "--receipt-out",
+    foreign,
+  ]);
+  expect(result.status).toBe(2);
+  expect(readFileSync(foreign, "utf8")).toBe(foreignBytes);
+  expect(existsSync(join(agent, "extensions", "early-compaction.js"))).toBe(
+    true,
+  );
+});
+
+test("remove rejects a case-variant settings.json receipt path", () => {
+  const agent = tempAgent();
+  const settings = join(agent, "settings.json");
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+  const before = readFileSync(settings);
+
+  const result = runCli([
+    "remove",
+    "--agent-dir",
+    agent,
+    "--receipt-out",
+    join(agent, "Settings.JSON"),
+  ]);
+  expect(result.status).toBe(2);
+  expect(readFileSync(settings)).toEqual(before);
+  expect(existsSync(join(agent, "extensions", "early-compaction.js"))).toBe(
+    true,
+  );
+});
+
+test("remove writes a legitimate receipt outside the agent dir", () => {
+  const agent = tempAgent();
+  const receiptDir = mkdtempSync(join(tmpdir(), "early-compaction-receipt-"));
+  temporaryDirs.push(receiptDir);
+  const receiptOut = join(receiptDir, "removal.json");
+  const install = runCli(["install", "--agent-dir", agent]);
+  expect(install.status, install.stderr).toBe(0);
+
+  const remove = runCli([
+    "remove",
+    "--agent-dir",
+    agent,
+    "--receipt-out",
+    receiptOut,
+  ]);
+  expect(remove.status, remove.stderr).toBe(0);
+  expect(readJson(receiptOut).command).toBe("remove");
+  expect(existsSync(join(agent, "extensions", "early-compaction.js"))).toBe(
+    false,
+  );
 });
 
 test("status exits 1 on installed drift", () => {
