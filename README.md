@@ -196,6 +196,10 @@ bun run qa:replay
 `qa:real-model` makes paid model calls and is run only when explicitly
 requested.
 
+## License
+
+MIT, see `LICENSE`. The builtin compaction prompts, task-intent derivation and threshold math are ported from `@code-yeongyu/senpi` (MIT); see `NOTICE`.
+
 ## 한국어 요약
 
 이 모드는 senpi의 조기 요약을 백그라운드에서 미리 준비해 두고, 캐시가 이미
