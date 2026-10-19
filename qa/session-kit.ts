@@ -118,6 +118,29 @@ export interface ApplyResult {
   reason: "ok" | "stale" | "rejected";
 }
 
+export interface RealCallCounts {
+  reload: number;
+  applyCompaction: number;
+  compact: number;
+  executeCompaction: number;
+  getCompactionSettings: number;
+  isIdleReads: number;
+  isIdleFalseReads: number;
+  isStreamingReads: number;
+  isStreamingTrueReads: number;
+  pendingMessagesReads: number;
+  pendingMessagesPositiveReads: number;
+  getBranch: number;
+  buildSessionContext: number;
+  appendContextEdit: number;
+}
+
+export interface GenerationCounts {
+  summaryCalls: number;
+  summarySignals: number;
+  summaryAborts: number;
+}
+
 export interface SessionKit {
   readonly tempAgentDir: string;
   readonly requests: ProviderRequestRecord[];
@@ -152,6 +175,10 @@ export interface SessionKit {
   emit(type: string, payload?: Record<string, unknown>): Promise<unknown>;
   /** In-process reload; the probe captures the new extension context. */
   reload(): Promise<unknown>;
+  /** Instrumented counters for the real AgentSession/SessionManager calls. */
+  realCallCounts(): RealCallCounts;
+  /** Instrumented counters for summary-provider calls and their abort signals. */
+  generationCounts(): GenerationCounts;
   /** Replace the in-memory extension path list before a reload. */
   setExtensionPaths(paths: string[]): void;
   /** Emit session_shutdown only; the session stays alive for late callbacks. */
@@ -175,6 +202,97 @@ interface Engine {
   DefaultResourceLoader: new (options: Record<string, unknown>) => any;
   SessionManager: { inMemory(cwd?: string): unknown };
   AssistantMessageEventStream: new () => any;
+  AgentSession: { prototype: any };
+}
+
+const REAL_CALL_MARK = Symbol.for("piomo.early-compaction.qa.real-calls.v1");
+const realCallRecords = new WeakMap<object, RealCallCounts>();
+
+function realCallsFor(target: object): RealCallCounts {
+  let record = realCallRecords.get(target);
+  if (record === undefined) {
+    record = {
+      reload: 0,
+      applyCompaction: 0,
+      compact: 0,
+      executeCompaction: 0,
+      getCompactionSettings: 0,
+      isIdleReads: 0,
+      isIdleFalseReads: 0,
+      isStreamingReads: 0,
+      isStreamingTrueReads: 0,
+      pendingMessagesReads: 0,
+      pendingMessagesPositiveReads: 0,
+      getBranch: 0,
+      buildSessionContext: 0,
+      appendContextEdit: 0,
+    };
+    realCallRecords.set(target, record);
+  }
+  return record;
+}
+
+/**
+ * Forwarding instrumentation over the real methods the scenarios name. Every
+ * wrapper calls the original; a zero counter therefore proves the named call
+ * never happened.
+ */
+function installRealCallInstrumentation(AgentSession: { prototype: any }, SessionManager: { prototype: any }): void {
+  const sessionProto = AgentSession.prototype;
+  const managerProto = SessionManager.prototype;
+  if (sessionProto[REAL_CALL_MARK] === true) return;
+  Object.defineProperty(sessionProto, REAL_CALL_MARK, { value: true, enumerable: false });
+
+  const wrapMethod = (proto: any, name: string, key: keyof RealCallCounts): void => {
+    const original = proto[name];
+    if (typeof original !== "function") return;
+    const wrapped = function (this: object, ...args: unknown[]) {
+      realCallsFor(this)[key] += 1;
+      return original.apply(this, args);
+    };
+    Object.defineProperty(wrapped, "name", { value: name });
+    Object.defineProperty(wrapped, "length", { value: original.length });
+    proto[name] = wrapped;
+  };
+
+  wrapMethod(sessionProto, "reload", "reload");
+  wrapMethod(sessionProto, "applyCompaction", "applyCompaction");
+  wrapMethod(sessionProto, "compact", "compact");
+  wrapMethod(sessionProto, "_executeCompaction", "executeCompaction");
+  wrapMethod(sessionProto, "_getCompactionSettings", "getCompactionSettings");
+  wrapMethod(managerProto, "getBranch", "getBranch");
+  wrapMethod(managerProto, "buildSessionContext", "buildSessionContext");
+  wrapMethod(managerProto, "appendContextEdit", "appendContextEdit");
+
+  const wrapGetter = (
+    name: string,
+    readsKey: keyof RealCallCounts,
+    conditionKey?: keyof RealCallCounts,
+    condition?: (value: unknown) => boolean,
+  ): void => {
+    const descriptor = Object.getOwnPropertyDescriptor(sessionProto, name);
+    const original = descriptor?.get;
+    if (typeof original !== "function") return;
+    Object.defineProperty(sessionProto, name, {
+      configurable: descriptor?.configurable ?? true,
+      enumerable: descriptor?.enumerable ?? false,
+      get(this: object) {
+        const counts = realCallsFor(this);
+        counts[readsKey] += 1;
+        const value = original.call(this);
+        if (conditionKey !== undefined && condition !== undefined && condition(value)) {
+          counts[conditionKey] += 1;
+        }
+        return value;
+      },
+    });
+  };
+
+  wrapGetter("isIdle", "isIdleReads", "isIdleFalseReads", (value) => value === false);
+  wrapGetter("isStreaming", "isStreamingReads", "isStreamingTrueReads", (value) => value === true);
+  wrapGetter("pendingMessageCount", "pendingMessagesReads", "pendingMessagesPositiveReads", (value) =>
+    typeof value === "number" && value > 0,
+  );
 }
 
 let enginePromise: Promise<Engine> | undefined;
@@ -182,15 +300,17 @@ let enginePromise: Promise<Engine> | undefined;
 function loadEngine(): Promise<Engine> {
   enginePromise ??= (async () => {
     const load = (absolute: string) => import(pathToFileURL(absolute).href);
-    const [sdk, auth, registry, settings, loader, sessions, piAi] = await Promise.all([
+    const [sdk, auth, registry, settings, loader, sessions, agentSession, piAi] = await Promise.all([
       load(path.join(SENPI_ROOT, "dist/core/sdk.js")),
       load(path.join(SENPI_ROOT, "dist/core/auth-storage.js")),
       load(path.join(SENPI_ROOT, "dist/core/model-registry.js")),
       load(path.join(SENPI_ROOT, "dist/core/settings-manager.js")),
       load(path.join(SENPI_ROOT, "dist/core/resource-loader.js")),
       load(path.join(SENPI_ROOT, "dist/core/session-manager.js")),
+      load(path.join(SENPI_ROOT, "dist/core/agent-session.js")),
       load(path.join(PIAI_ROOT, "dist/index.js")),
     ]);
+    installRealCallInstrumentation(agentSession.AgentSession, sessions.SessionManager);
     return {
       createAgentSession: sdk.createAgentSession as Engine["createAgentSession"],
       AuthStorage: auth.AuthStorage as Engine["AuthStorage"],
@@ -199,6 +319,7 @@ function loadEngine(): Promise<Engine> {
       DefaultResourceLoader: loader.DefaultResourceLoader as Engine["DefaultResourceLoader"],
       SessionManager: sessions.SessionManager as Engine["SessionManager"],
       AssistantMessageEventStream: piAi.AssistantMessageEventStream as Engine["AssistantMessageEventStream"],
+      AgentSession: agentSession.AgentSession as Engine["AgentSession"],
     };
   })();
   return enginePromise;
@@ -284,6 +405,7 @@ export async function startSession(options: SessionKitOptions): Promise<SessionK
   const ui: UiRecorder = { statuses: [], notices: [] };
   let chatIndex = 0;
   let summaryIndex = 0;
+  const generation: GenerationCounts = { summaryCalls: 0, summarySignals: 0, summaryAborts: 0 };
   const contextWindow = options.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   const maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
   const failSummary = new Set(options.failSummaryCalls ?? []);
@@ -433,7 +555,7 @@ export async function startSession(options: SessionKitOptions): Promise<SessionK
             maxTokens,
           },
         ],
-        streamSimple: (_model: unknown, context: any) => {
+        streamSimple: (_model: unknown, context: any, streamOptions?: { signal?: AbortSignal }) => {
           const rawMessages = Array.isArray(context?.messages) ? context.messages : [];
           const kind: "chat" | "summary" = isSummaryRequest(rawMessages) ? "summary" : "chat";
           const record: ProviderRequestRecord = {
@@ -447,6 +569,18 @@ export async function startSession(options: SessionKitOptions): Promise<SessionK
           };
           requests.push(record);
           if (kind === "summary") {
+            generation.summaryCalls += 1;
+            const signal = streamOptions?.signal;
+            if (signal !== undefined) {
+              generation.summarySignals += 1;
+              if (signal.aborted) {
+                generation.summaryAborts += 1;
+              } else {
+                signal.addEventListener("abort", () => {
+                  generation.summaryAborts += 1;
+                }, { once: true });
+              }
+            }
             const index = summaryIndex++;
             if (failSummary.has(index)) {
               throw new Error(`session kit: summary call ${index} forced to fail`);
@@ -624,6 +758,31 @@ export async function startSession(options: SessionKitOptions): Promise<SessionK
       },
       async reload() {
         return await session.reload();
+      },
+      realCallCounts() {
+        const sessionCounts = realCallsFor(session);
+        const managerCounts = realCallsFor(
+          (session as { sessionManager?: object }).sessionManager ?? session,
+        );
+        return {
+          reload: sessionCounts.reload,
+          applyCompaction: sessionCounts.applyCompaction,
+          compact: sessionCounts.compact,
+          executeCompaction: sessionCounts.executeCompaction,
+          getCompactionSettings: sessionCounts.getCompactionSettings,
+          isIdleReads: sessionCounts.isIdleReads,
+          isIdleFalseReads: sessionCounts.isIdleFalseReads,
+          isStreamingReads: sessionCounts.isStreamingReads,
+          isStreamingTrueReads: sessionCounts.isStreamingTrueReads,
+          pendingMessagesReads: sessionCounts.pendingMessagesReads,
+          pendingMessagesPositiveReads: sessionCounts.pendingMessagesPositiveReads,
+          getBranch: managerCounts.getBranch,
+          buildSessionContext: managerCounts.buildSessionContext,
+          appendContextEdit: managerCounts.appendContextEdit,
+        };
+      },
+      generationCounts() {
+        return { ...generation };
       },
       setExtensionPaths(paths: string[]) {
         session.settingsManager.setExtensionPaths(paths);

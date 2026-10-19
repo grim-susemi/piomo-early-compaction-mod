@@ -294,6 +294,16 @@ class Worker {
     return this.metrics(kit).filter((event) => event.event === name);
   }
 
+  /** Forwarding counters over the real AgentSession/SessionManager methods. */
+  realCalls(kit: SessionKit) {
+    return kit.realCallCounts();
+  }
+
+  /** Forwarding counters over summary provider calls and their abort signals. */
+  generation(kit: SessionKit) {
+    return kit.generationCounts();
+  }
+
   async settle(kit: SessionKit): Promise<void> {
     await kit.emit("agent_settled", { type: "agent_settled" });
   }
@@ -344,6 +354,7 @@ class Worker {
     headerCount: number;
     sections: boolean;
     kind: string | undefined;
+    applyCompactionCalls: number;
   }> {
     await kit.prompt(`Seed prompt. ${big(200)}`);
     this.seedCompaction(
@@ -359,13 +370,17 @@ class Worker {
     );
     if (!applied) throw new Error("S1: no boundary apply was recorded");
     const apply = this.events(kit, "apply").find((event) => event.result === "ok");
+    const calls = this.realCalls(kit);
+    if (calls.applyCompaction < 1) {
+      throw new Error("S1: the real AgentSession.applyCompaction was never called");
+    }
     const entry = kit.compactionEvents.find((event) => event.accepted && event.fromExtension);
     if (!entry) throw new Error("S1: no accepted extension compaction event");
     const summary = entry.summary ?? "";
     const headerCount = notesHeaderCount(summary);
     const sections = hasAllNotesSections(summary);
     const kind = (entry.details as any)?.earlyCompaction?.kind;
-    return { apply, entry, summary, headerCount, sections, kind };
+    return { apply, entry, summary, headerCount, sections, kind, applyCompactionCalls: calls.applyCompaction };
   }
 
   async finish(): Promise<WorkerResult> {
@@ -435,7 +450,7 @@ async function armA(worker: Worker): Promise<void> {
       await kit.prompt("Stock second prompt.");
       const log = await kit.readCompactionLog();
       const count = log.filter((event) => event.event === "speculative_started").length;
-      worker.artifacts.s6a = { speculativeStarted: count };
+      worker.artifacts.s6a = { speculativeStarted: count, chatRequests: kit.requests.filter((request) => request.kind === "chat").length };
       if (count < 1) throw new Error(`arm A had ${count} speculative_started events`);
       return `stock builtin speculative_started=${count}`;
     } finally {
@@ -485,6 +500,8 @@ async function armG(worker: Worker): Promise<void> {
       const parked = fs.existsSync(path.join(kit.tempAgentDir, "early-compaction", "parked", "early-compaction.js"));
       const active = fs.existsSync(path.join(kit.tempAgentDir, "extensions", "early-compaction.js"));
       if (!parked || active) throw new Error(`parking failed: parked=${parked} active=${active}`);
+      const modLoaded = kit.loadedExtensions.some((file) => path.basename(file).startsWith("early-compaction"));
+      if (modLoaded) throw new Error(`G: the parked mod is still loaded: ${JSON.stringify(kit.loadedExtensions)}`);
       await kit.prompt("Parked S7 first prompt.");
       await kit.prompt("Parked S7 second prompt.");
       const snapshot = {
@@ -494,9 +511,10 @@ async function armG(worker: Worker): Promise<void> {
         uiNotices: kit.ui.notices.filter((notice) => notice.message.includes("early-compaction")).length,
         parked,
         active,
+        modLoaded,
       };
       worker.artifacts.s7g = snapshot;
-      return `parked entries=${snapshot.entryTypes.join(",")} compactions=${snapshot.compactionCount} footer=${snapshot.uiStatuses}`;
+      return `parked entries=${snapshot.entryTypes.join(",")} compactions=${snapshot.compactionCount} footer=${snapshot.uiStatuses} realOffParked=true`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -526,9 +544,10 @@ async function armB(worker: Worker): Promise<void> {
         sections: result.sections,
         summaryPrefixKept: result.summary.startsWith("BASE SUMMARY"),
         details: (result.entry as any).details,
+        applyCompactionCalls: result.applyCompactionCalls,
         gate: worker.events(kit, "gate").at(-1) ?? null,
       };
-      return `boundary apply={applied:true,reason:ok} kind=${result.kind} headers=${result.headerCount} sections=5`;
+      return `boundary apply={applied:true,reason:ok} kind=${result.kind} headers=${result.headerCount} sections=5 realApplyCompaction=${result.applyCompactionCalls}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -549,18 +568,38 @@ async function armB(worker: Worker): Promise<void> {
       const streaming = kit.prompt("Streaming second prompt.");
       await kit.waitForChatStart();
       const isStreaming = kit.isStreaming();
+      const beforeStream = worker.realCalls(kit);
       worker.clock.fireIntervals();
       await kit.waitFor(() => false, 40);
+      const calls = worker.realCalls(kit);
       const applies = worker.events(kit, "apply").length;
       const discards = worker.events(kit, "discard").length;
+      const applyCompactionDelta = calls.applyCompaction - beforeStream.applyCompaction;
+      const idleFalseReads = calls.isIdleFalseReads - beforeStream.isIdleFalseReads;
+      const streamingTrueReads = calls.isStreamingTrueReads - beforeStream.isStreamingTrueReads;
       kit.releaseChat();
       await streaming;
       if (!isStreaming) throw new Error("S2: session was not streaming");
       if (applies !== 0 || discards !== 0) {
         throw new Error(`S2: applies=${applies} discards=${discards} during the stream`);
       }
-      worker.artifacts.s2 = { isStreaming, appliesDuringStream: applies, discardsDuringStream: discards };
-      return `streaming=true applies=0 while the run was open`;
+      if (applyCompactionDelta !== 0) {
+        throw new Error(`S2: real applyCompaction calls=${applyCompactionDelta} during the stream`);
+      }
+      if (idleFalseReads < 1) {
+        throw new Error(
+          `S2: real gating state was not observed (isIdle=false reads=${idleFalseReads})`,
+        );
+      }
+      worker.artifacts.s2 = {
+        isStreaming,
+        appliesDuringStream: applies,
+        discardsDuringStream: discards,
+        applyCompactionDelta,
+        idleFalseReads,
+        streamingTrueReads,
+      };
+      return `streaming=true applies=0 while the run was open; real isIdle=false reads=${idleFalseReads}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -588,8 +627,12 @@ async function armB(worker: Worker): Promise<void> {
       if (apply.route !== "cold" || apply.site !== "timer") {
         throw new Error(`S3: route=${apply.route} site=${apply.site}`);
       }
-      worker.artifacts.s3 = apply;
-      return `idle timer apply route=cold site=timer after TTL+grace`;
+      const calls = worker.realCalls(kit);
+      if (calls.applyCompaction < 1) {
+        throw new Error("S3: the real AgentSession.applyCompaction was never called");
+      }
+      worker.artifacts.s3 = { ...apply, applyCompactionCalls: calls.applyCompaction };
+      return `idle timer apply route=cold site=timer after TTL+grace; realApplyCompaction=${calls.applyCompaction}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -613,11 +656,22 @@ async function armB(worker: Worker): Promise<void> {
         kit,
         (event) => event.event === "discard" && event.reason === "context-edit",
       );
+      const calls = worker.realCalls(kit);
       const applies = worker.events(kit, "apply").length;
       if (!discarded) throw new Error("S4: no context-edit discard");
-      if (applies !== 0) throw new Error(`S4: ${applies} applies followed the edit`);
-      worker.artifacts.s4 = { discard: "context-edit", applies };
-      return `READY job discarded (context-edit); applies=0`;
+      if (calls.appendContextEdit < 1) {
+        throw new Error("S4: the real SessionManager.appendContextEdit was never called");
+      }
+      if (applies !== 0 || calls.applyCompaction !== 0) {
+        throw new Error(`S4: applies=${applies} realApplyCompaction=${calls.applyCompaction} followed the edit`);
+      }
+      worker.artifacts.s4 = {
+        discard: "context-edit",
+        applies,
+        appendContextEditCalls: calls.appendContextEdit,
+        applyCompactionCalls: calls.applyCompaction,
+      };
+      return `READY job discarded (context-edit); applies=0; realAppendContextEdit=${calls.appendContextEdit}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -653,10 +707,21 @@ async function armB(worker: Worker): Promise<void> {
       const summaryIndex = kit.requests.findIndex((request, index) => index > 1 && request.kind === "summary");
       const chatIndex = kit.requests.findIndex((request, index) => index > summaryIndex && request.kind === "chat");
       const applies = worker.events(kit, "apply").length;
+      const calls = worker.realCalls(kit);
       if (chatIndex < 0) throw new Error("S5: no chat request after the builtin summary");
       if (applies !== 0) throw new Error(`S5: mod applied ${applies} times`);
-      worker.artifacts.s5 = { failed: true, builtinCompacted: true, chatIndex, summaryIndex, applies };
-      return `generation failed; builtin compacted before the next prompt; mod applies=0`;
+      if (calls.executeCompaction < 1) {
+        throw new Error("S5: the real AgentSession._executeCompaction never ran");
+      }
+      worker.artifacts.s5 = {
+        failed: true,
+        builtinCompacted: true,
+        chatIndex,
+        summaryIndex,
+        applies,
+        executeCompactionCalls: calls.executeCompaction,
+      };
+      return `generation failed; builtin compacted before the next prompt; mod applies=0; realExecuteCompaction=${calls.executeCompaction}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -678,12 +743,20 @@ async function armB(worker: Worker): Promise<void> {
       const flags = kit.getCompactionSettings();
       const log = await kit.readCompactionLog();
       const count = log.filter((event) => event.event === "speculative_started").length;
+      const calls = worker.realCalls(kit);
       if (flags?.speculativeEnabled !== false || flags?.idleCompactionEnabled !== false) {
         throw new Error(`S6: active flags ${JSON.stringify(flags)}`);
       }
+      if (calls.getCompactionSettings < 1) {
+        throw new Error("S6: the real AgentSession._getCompactionSettings was never read");
+      }
       if (count !== 0) throw new Error(`S6: arm B had ${count} speculative_started events`);
-      worker.artifacts.s6b = { speculativeStarted: count, flags };
-      return `active flags false; builtin speculative_started=0`;
+      worker.artifacts.s6b = {
+        speculativeStarted: count,
+        flags,
+        getCompactionSettingsCalls: calls.getCompactionSettings,
+      };
+      return `active flags false; builtin speculative_started=0; realSettingsReads=${calls.getCompactionSettings}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -734,10 +807,14 @@ async function armB(worker: Worker): Promise<void> {
       if (!applied) throw new Error("S13: input seam did not apply the threshold route");
       const apply = worker.events(kit, "apply").find((event) => event.result === "ok");
       const ran = kit.requests.some((request) => request.kind === "chat" && request.messages.some((message) => message.text.includes("Threshold handoff prompt")));
+      const calls = worker.realCalls(kit);
       if (apply.site !== "input") throw new Error(`S13: site ${apply.site}`);
+      if (calls.applyCompaction < 1) {
+        throw new Error("S13: the real AgentSession.applyCompaction was never called");
+      }
       if (!ran) throw new Error("S13: the prompt did not run");
-      worker.artifacts.s13 = { apply, promptRan: ran };
-      return `threshold apply at input; prompt ran`;
+      worker.artifacts.s13 = { apply, promptRan: ran, applyCompactionCalls: calls.applyCompaction };
+      return `threshold apply at input; prompt ran; realApplyCompaction=${calls.applyCompaction}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -761,46 +838,114 @@ async function armB(worker: Worker): Promise<void> {
       if (!compacted) throw new Error("S14: builtin compaction did not run");
       const aborted = worker.events(kit, "job_end").find((event) => event.outcome === "aborted");
       const appliesBeforeRelease = worker.events(kit, "apply").length;
+      const generationAfterCompaction = worker.generation(kit);
+      const executeCompactionCalls = worker.realCalls(kit).executeCompaction;
       kit.releaseSummary();
       await kit.waitFor(() => false, 60);
       const compactions = kit.getEntries().filter((entry) => entry.type === "compaction").length;
       const appliesAfterRelease = worker.events(kit, "apply").length;
+      const callsAfterRelease = worker.realCalls(kit);
       if (!aborted) throw new Error("S14: GENERATING job was not aborted");
+      if (generationAfterCompaction.summaryAborts < 1) {
+        throw new Error("S14: the real deferred summary abort signal never fired");
+      }
+      if (executeCompactionCalls < 1) {
+        throw new Error("S14: the real AgentSession._executeCompaction never ran");
+      }
+      if (callsAfterRelease.applyCompaction < 1) {
+        throw new Error("S14: the builtin's real AgentSession.applyCompaction was never called");
+      }
       if (appliesBeforeRelease !== 0 || appliesAfterRelease !== 0) {
-        throw new Error(`S14: applies ${appliesBeforeRelease}/${appliesAfterRelease}`);
+        throw new Error(`S14: mod applies ${appliesBeforeRelease}/${appliesAfterRelease}`);
       }
       if (compactions !== 1) throw new Error(`S14: compactions=${compactions}`);
-      worker.artifacts.s14 = { aborted, applies: appliesAfterRelease, compactions };
-      return `job aborted by the builtin compaction; compactions=1 applies=0`;
+      worker.artifacts.s14 = {
+        aborted,
+        applies: appliesAfterRelease,
+        compactions,
+        summaryAborts: generationAfterCompaction.summaryAborts,
+        executeCompactionCalls,
+        builtinApplyCompactionCalls: callsAfterRelease.applyCompaction,
+      };
+      return `job aborted by the builtin compaction; compactions=1 modApplies=0; realAbortSignals=${generationAfterCompaction.summaryAborts}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
   });
 
   await worker.scenario("S15", async () => {
-    let first: SessionKit | undefined;
-    let second: SessionKit | undefined;
+    let kit: SessionKit | undefined;
     try {
-      first = await worker.open({
+      kit = await worker.open({
         deferSummaryCalls: [0],
+        ui: true,
         chat: [{ text: big(6000), usage: usage(50_000) }],
       });
-      await first.prompt(`Reload first prompt. ${big(12000)}`);
-      const generating = await worker.waitForMetric(first, (event) => event.event === "job_start");
+      await kit.prompt(`Reload first prompt. ${big(12000)}`);
+      const generating = await worker.waitForMetric(kit, (event) => event.event === "job_start");
       if (!generating) throw new Error("S15: job did not start");
-      await first.shutdown("reload");
-      second = await worker.open({ chat: [{ text: "second generation", usage: usage(10_000) }] });
-      await second.prompt("Second generation prompt.");
-      first.releaseSummary();
-      await first.waitFor(() => false, 60);
-      const flags = second.getCompactionSettings();
+
+      const beforeReload = worker.realCalls(kit);
+      await kit.reload();
+      const afterReload = worker.realCalls(kit);
+      const reloadCalls = afterReload.reload - beforeReload.reload;
+      if (reloadCalls < 1) {
+        throw new Error("S15: the real AgentSession.reload was never called");
+      }
+
+      const discard = worker
+        .events(kit, "discard")
+        .find((event) => event.reason === "session-shutdown");
+      const aborted = worker
+        .events(kit, "job_end")
+        .find((event) => event.outcome === "aborted" && event.reason === "aborted");
+      if (!discard) throw new Error("S15: the old generation was not discarded on reload");
+      if (!aborted) throw new Error("S15: the old generation's job was not recorded aborted");
+
+      const generationAtReload = worker.generation(kit);
+      if (generationAtReload.summaryAborts < 1) {
+        throw new Error("S15: the real deferred summary abort signal never fired");
+      }
+
+      kit.releaseSummary();
+      await kit.waitFor(() => false, 80);
+      const afterRelease = worker.realCalls(kit);
+      if (afterRelease.applyCompaction !== 0) {
+        throw new Error(`S15: ${afterRelease.applyCompaction} real applyCompaction calls followed the reload`);
+      }
+      if (kit.compactionEvents.some((event) => event.accepted)) {
+        throw new Error("S15: an accepted compaction followed the reload");
+      }
+
+      const activeGates = worker.events(kit, "gate").filter((event) => event.state === "active");
+      if (activeGates.length < 2) {
+        throw new Error(
+          `S15: the reloaded generation did not re-gate active (gates=${JSON.stringify(
+            worker.events(kit, "gate"),
+          )} metrics=${JSON.stringify(worker.metrics(kit).map((event) => event.event + ":" + (event.state ?? event.outcome ?? event.reason ?? event.result ?? "")))} flags=${JSON.stringify(
+            kit.getCompactionSettings(),
+          )} loaded=${JSON.stringify(kit.loadedExtensions)} ctxAgentDir=${String(kit.ctx?.agentDir)})`,
+        );
+      }
+      const flags = kit.getCompactionSettings();
+      if (flags?.speculativeEnabled !== false || flags?.idleCompactionEnabled !== false) {
+        throw new Error(`S15: reloaded generation flags ${JSON.stringify(flags)}`);
+      }
       if (worker.uncaught.length > 0) throw new Error(`S15: ${worker.uncaught.join("\n")}`);
-      if (flags?.speculativeEnabled !== false) throw new Error("S15: reloaded generation is not active");
-      worker.artifacts.s15 = { uncaught: worker.uncaught.length, reloadedActive: true };
-      return `reload during GENERATING: no uncaught exception; new generation active`;
+      worker.artifacts.s15 = {
+        uncaught: worker.uncaught.length,
+        reloadedActive: true,
+        reloadCalls,
+        summaryAborts: generationAtReload.summaryAborts,
+        discard: discard.reason,
+        aborted: aborted.outcome,
+        activeGates: activeGates.length,
+        flags,
+        applyCompactionCalls: afterRelease.applyCompaction,
+      };
+      return `real reload=${reloadCalls} during GENERATING; old generation aborted (summaryAborts=${generationAtReload.summaryAborts}, discard=${discard.reason}); no apply; reloaded generation active`;
     } finally {
-      if (first) await worker.dispose(first);
-      if (second) await worker.dispose(second);
+      if (kit) await worker.dispose(kit);
     }
   });
 
@@ -848,8 +993,13 @@ async function armB(worker: Worker): Promise<void> {
         inherited,
         builtinReason: builtinEvent.reason,
         markerInBuiltinPrompt: true,
+        applyCompactionCalls: result.applyCompactionCalls,
+        executeCompactionCalls: worker.realCalls(kit).executeCompaction,
       };
-      return `builtin compacted the notes summary; taskIntent inherited into the prompt`;
+      if (worker.realCalls(kit).executeCompaction < 1) {
+        throw new Error("S16: the real AgentSession._executeCompaction never ran");
+      }
+      return `builtin compacted the notes summary; taskIntent inherited into the prompt; realExecuteCompaction=${worker.realCalls(kit).executeCompaction}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -868,16 +1018,29 @@ async function armB(worker: Worker): Promise<void> {
         schema: "senpi.compaction.todo-snapshot.v1",
         todos: [{ id: "t1", content: "restore me", status: "pending" }],
       });
+      const beforeTimer = worker.realCalls(kit);
       worker.clock.advance(331_000);
       worker.clock.fireIntervals();
       await kit.waitFor(() => false, 60);
+      const calls = worker.realCalls(kit);
       const applies = worker.events(kit, "apply").length;
       const discards = worker.events(kit, "discard").length;
       if (applies !== 0 || discards !== 0) {
         throw new Error(`S17: applies=${applies} discards=${discards}`);
       }
-      worker.artifacts.s17 = { applies, discards, todoRestoreSkipped: true };
-      return `cold idle timer skipped the apply in the todo-restore state`;
+      if (calls.applyCompaction !== 0) {
+        throw new Error(`S17: ${calls.applyCompaction} real applyCompaction calls`);
+      }
+      if (calls.getBranch - beforeTimer.getBranch < 1) {
+        throw new Error("S17: the idle timer did not consult the real SessionManager.getBranch");
+      }
+      worker.artifacts.s17 = {
+        applies,
+        discards,
+        todoRestoreSkipped: true,
+        getBranchReadsDuringTimer: calls.getBranch - beforeTimer.getBranch,
+      };
+      return `cold idle timer skipped the apply in the todo-restore state; realGetBranch reads=${calls.getBranch - beforeTimer.getBranch}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -896,10 +1059,13 @@ async function armB(worker: Worker): Promise<void> {
       });
       await kit.prompt(`Fresh 262k first prompt. ${big(25000)}`);
       await worker.makeReady(kit, "S18");
+      const before066 = worker.realCalls(kit);
       worker.clock.advance(10_000);
       worker.clock.fireIntervals();
       await kit.waitFor(() => false, 40);
+      const after066 = worker.realCalls(kit);
       const appliesAt066 = worker.events(kit, "apply").length;
+      const applyCallsAt066 = after066.applyCompaction - before066.applyCompaction;
       await kit.prompt("Threshold prompt at 0.70W.");
       const applied = await worker.waitForMetric(
         kit,
@@ -907,10 +1073,14 @@ async function armB(worker: Worker): Promise<void> {
       );
       if (!applied) throw new Error("S18: no threshold apply at 0.70W");
       const apply = worker.events(kit, "apply").find((event) => event.result === "ok");
-      if (appliesAt066 !== 0) throw new Error(`S18: ${appliesAt066} applies at 0.66W`);
+      const applyCalls = worker.realCalls(kit).applyCompaction;
+      if (appliesAt066 !== 0 || applyCallsAt066 !== 0) {
+        throw new Error(`S18: ${appliesAt066} applies/${applyCallsAt066} real calls at 0.66W`);
+      }
+      if (applyCalls < 1) throw new Error("S18: the real AgentSession.applyCompaction was never called");
       if (apply.site !== "agent_settled") throw new Error(`S18: site ${apply.site}`);
-      worker.artifacts.s18 = { appliesAt066, apply };
-      return `no apply at 0.66W; threshold apply at 0.70W`;
+      worker.artifacts.s18 = { appliesAt066, applyCallsAt066, apply, applyCompactionCalls: applyCalls };
+      return `no apply at 0.66W; threshold apply at 0.70W; realApplyCompaction=${applyCalls}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -939,8 +1109,17 @@ async function armB(worker: Worker): Promise<void> {
       const crossing = worker.events(kit, "threshold_cross").find((event) => event.U === 35_200);
       if (reference !== 0.55) throw new Error(`S19: reference threshold ${reference}`);
       if (crossing && crossing.T !== 35_200) throw new Error(`S19: mod T=${crossing.T}`);
-      worker.artifacts.s19 = { apply: worker.events(kit, "apply")[0], reference, crossing };
-      return `threshold apply at 0.55W; stock T=35200`;
+      const calls = worker.realCalls(kit);
+      if (calls.applyCompaction < 1) {
+        throw new Error("S19: the real AgentSession.applyCompaction was never called");
+      }
+      worker.artifacts.s19 = {
+        apply: worker.events(kit, "apply")[0],
+        reference,
+        crossing,
+        applyCompactionCalls: calls.applyCompaction,
+      };
+      return `threshold apply at 0.55W; stock T=35200; realApplyCompaction=${calls.applyCompaction}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -983,8 +1162,17 @@ async function armB(worker: Worker): Promise<void> {
       if (!crossing) throw new Error("S20: no threshold_cross after the high-yield compaction");
       const observed = worker.events(kit, "threshold_cross").find((event) => event.U === 173_016);
       if (observed.T !== expected) throw new Error(`S20: mod T=${observed.T} expected=${expected}`);
-      worker.artifacts.s20 = { structuralYield: sy, expected, observed };
-      return `high-yield builtin yield lowered the mod T to ${observed.T} (stock ${expected})`;
+      const calls = worker.realCalls(kit);
+      if (calls.executeCompaction < 1) {
+        throw new Error("S20: the real AgentSession._executeCompaction never ran");
+      }
+      worker.artifacts.s20 = {
+        structuralYield: sy,
+        expected,
+        observed,
+        executeCompactionCalls: calls.executeCompaction,
+      };
+      return `high-yield builtin yield lowered the mod T to ${observed.T} (stock ${expected}); realExecuteCompaction=${calls.executeCompaction}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -1024,8 +1212,21 @@ async function armC(worker: Worker, order: OrderEntry[]): Promise<void> {
         });
       }
       if (!installed) throw new Error("C: OMO receipt has no installed patch");
-      worker.artifacts.c = { order, flags, omoInstalled: installed };
-      return `OMO order ${order.join(">")}: mod active and apply ok`;
+      const calls = worker.realCalls(kit);
+      if (calls.applyCompaction < 1) {
+        throw new Error("C: the real AgentSession.applyCompaction was never called");
+      }
+      if (calls.getCompactionSettings < 1) {
+        throw new Error("C: the real AgentSession._getCompactionSettings was never read");
+      }
+      worker.artifacts.c = {
+        order,
+        flags,
+        omoInstalled: installed,
+        applyCompactionCalls: calls.applyCompaction,
+        getCompactionSettingsCalls: calls.getCompactionSettings,
+      };
+      return `OMO order ${order.join(">")}: mod active and apply ok; realApplyCompaction=${calls.applyCompaction}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -1057,8 +1258,12 @@ async function armD(worker: Worker): Promise<void> {
       if (warnings !== 0) throw new Error(`D: warnings=${warnings}`);
       if (flags?.speculativeEnabled !== true) throw new Error(`D: flags ${JSON.stringify(flags)}`);
       if (speculative < 1) throw new Error("D: stock speculative did not start");
-      worker.artifacts.d = { gate, warnings, speculative };
-      return `dormant(env), warnings=0, stock speculative_started=${speculative}`;
+      const calls = worker.realCalls(kit);
+      if (calls.getCompactionSettings < 1) {
+        throw new Error("D: the real AgentSession._getCompactionSettings was never read");
+      }
+      worker.artifacts.d = { gate, warnings, speculative, getCompactionSettingsCalls: calls.getCompactionSettings };
+      return `dormant(env), warnings=0, stock speculative_started=${speculative}; realSettingsReads=${calls.getCompactionSettings}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -1092,8 +1297,12 @@ async function armE(worker: Worker): Promise<void> {
         if (gate?.state !== "dormant" || gate?.reason !== "mode") throw new Error(`${entry.id}: gate ${JSON.stringify(gate)}`);
         if (warnings !== 0 || statuses !== 0) throw new Error(`${entry.id}: UI output appeared`);
         if (flags?.speculativeEnabled !== true) throw new Error(`${entry.id}: flags ${JSON.stringify(flags)}`);
-        worker.artifacts[entry.id] = { gate, warnings, flags };
-        return `${entry.id}: dormant(mode), warnings=0`;
+        const calls = worker.realCalls(kit);
+        if (calls.getCompactionSettings < 1) {
+          throw new Error(`${entry.id}: the real AgentSession._getCompactionSettings was never read`);
+        }
+        worker.artifacts[entry.id] = { gate, warnings, flags, getCompactionSettingsCalls: calls.getCompactionSettings };
+        return `${entry.id}: dormant(mode), warnings=0; realSettingsReads=${calls.getCompactionSettings}`;
       } finally {
         if (kit) await worker.dispose(kit);
       }
@@ -1125,8 +1334,18 @@ async function armF(worker: Worker, variant: "version" | "fingerprint"): Promise
           )} notices=${JSON.stringify(kit.ui.notices)} metrics=${JSON.stringify(worker.metrics(kit))}`,
         );
       }
-      worker.artifacts.f = { variant, gate, warnings, footer };
-      return `dormant(unqualified), warnings=1, footer=${footer}`;
+      const calls = worker.realCalls(kit);
+      if (calls.getCompactionSettings < 1) {
+        throw new Error("F: the real AgentSession._getCompactionSettings was never read");
+      }
+      worker.artifacts.f = {
+        variant,
+        gate,
+        warnings,
+        footer,
+        getCompactionSettingsCalls: calls.getCompactionSettings,
+      };
+      return `dormant(unqualified), warnings=1, footer=${footer}; realSettingsReads=${calls.getCompactionSettings}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -1172,12 +1391,17 @@ async function armH(worker: Worker, order: OrderEntry[]): Promise<void> {
       const streaming = kit.prompt("Streaming turn before the queued message.");
       await kit.waitForChatStart();
       const queuedText = `${QUEUED_MARKER} keep this text unchanged.`;
+      const beforeQueue = worker.realCalls(kit);
       await kit.session.followUp(queuedText);
       const pending = await kit.waitFor(() => kit.hasPendingMessages() === true, 200);
       if (!pending) throw new Error("H queued: hasPendingMessages never became true");
       worker.clock.fireIntervals();
       await kit.waitFor(() => false, 30);
+      const whileQueued = worker.realCalls(kit);
       const appliesWhileQueued = worker.events(kit, "apply").length;
+      const applyCallsWhileQueued = whileQueued.applyCompaction - beforeQueue.applyCompaction;
+      const pendingPositiveReads =
+        whileQueued.pendingMessagesPositiveReads - beforeQueue.pendingMessagesPositiveReads;
       kit.releaseChat();
       await streaming;
       const delivered = await kit.waitFor(
@@ -1189,10 +1413,29 @@ async function armH(worker: Worker, order: OrderEntry[]): Promise<void> {
         kit,
         (event) => event.event === "apply" && event.result === "ok",
       );
-      if (appliesWhileQueued !== 0) throw new Error(`H queued: ${appliesWhileQueued} applies while queued`);
+      if (appliesWhileQueued !== 0 || applyCallsWhileQueued !== 0) {
+        throw new Error(
+          `H queued: ${appliesWhileQueued} applies/${applyCallsWhileQueued} real calls while queued`,
+        );
+      }
+      if (pendingPositiveReads < 1) {
+        throw new Error("H queued: the real pending-message state was never observed");
+      }
       if (!appliedAfter) throw new Error("H queued: no apply after the delivery");
-      worker.artifacts.hQueued = { pending, appliesWhileQueued, delivered, appliedAfter: true };
-      return `pending blocked the apply; queued text delivered unchanged; apply followed`;
+      const afterApply = worker.realCalls(kit);
+      if (afterApply.applyCompaction - beforeQueue.applyCompaction < 1) {
+        throw new Error("H queued: the real AgentSession.applyCompaction was never called after delivery");
+      }
+      worker.artifacts.hQueued = {
+        pending,
+        appliesWhileQueued,
+        applyCallsWhileQueued,
+        pendingPositiveReads,
+        delivered,
+        appliedAfter: true,
+        applyCompactionCalls: afterApply.applyCompaction - beforeQueue.applyCompaction,
+      };
+      return `pending blocked the apply; queued text delivered unchanged; apply followed; realPendingReads=${pendingPositiveReads}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -1209,7 +1452,10 @@ async function armH(worker: Worker, order: OrderEntry[]): Promise<void> {
       await kit.prompt("Reload prompt before the in-process reload.");
       const before = kit.getCompactionSettings();
       if (before?.speculativeEnabled !== false) throw new Error("H reload: mod was not active before reload");
+      const beforeReload = worker.realCalls(kit);
       await kit.reload();
+      const reloadCalls = worker.realCalls(kit).reload - beforeReload.reload;
+      if (reloadCalls < 1) throw new Error("H reload: the real AgentSession.reload was never called");
       const after = kit.getCompactionSettings();
       if (after?.speculativeEnabled !== false) throw new Error("H reload: mod did not re-gate active");
       const tools = kit.session.extensionRunner.getAllRegisteredTools();
@@ -1225,8 +1471,8 @@ async function armH(worker: Worker, order: OrderEntry[]): Promise<void> {
       const text = contentOf(result);
       if (text.length === 0) throw new Error("H reload: coordination_inspect returned no content");
       if (worker.uncaught.length > 0) throw new Error(`H reload: ${worker.uncaught.join("\n")}`);
-      worker.artifacts.hReload = { before, after, coordination: result.details ?? null };
-      return `reload raised no uncaught exception; mod active; coordination_inspect answered`;
+      worker.artifacts.hReload = { before, after, coordination: result.details ?? null, reloadCalls };
+      return `realReload=${reloadCalls}; reload raised no uncaught exception; mod active; coordination_inspect answered`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -1259,7 +1505,12 @@ async function armReloadParked(worker: Worker): Promise<void> {
       kit.setExtensionPaths(
         kit.loadedExtensions.filter((file) => !path.basename(file).startsWith("early-compaction")),
       );
+      const beforeReloadCalls = worker.realCalls(kit);
       await kit.reload();
+      const reloadCalls = worker.realCalls(kit).reload - beforeReloadCalls.reload;
+      if (reloadCalls < 1) {
+        throw new Error("S11: the real AgentSession.reload was never called");
+      }
       const after = kit.getCompactionSettings();
       if (after?.speculativeEnabled !== true) throw new Error(`S11: flags after reload ${JSON.stringify(after)}`);
       await kit.prompt(`After reload prompt. ${big(4000)}`);
@@ -1276,8 +1527,8 @@ async function armReloadParked(worker: Worker): Promise<void> {
         );
       }
       if (worker.uncaught.length > 0) throw new Error(`S11: ${worker.uncaught.join("\n")}`);
-      worker.artifacts.s11 = { before, after, speculativeStarted: count };
-      return `reload with the mod parked restored stock flags; speculative_started=${count}`;
+      worker.artifacts.s11 = { before, after, speculativeStarted: count, reloadCalls };
+      return `reload with the mod parked restored stock flags; realReload=${reloadCalls}; speculative_started=${count}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
@@ -1304,7 +1555,14 @@ async function armTwoSessions(worker: Worker): Promise<void> {
       await inactive.prompt("Inactive session prompt.");
       const activeFlags = active.getCompactionSettings();
       const inactiveFlags = inactive.getCompactionSettings();
+      const activeCalls = worker.realCalls(active);
+      const inactiveCalls = worker.realCalls(inactive);
       const gate = worker.events(inactive, "gate").at(-1);
+      if (activeCalls.getCompactionSettings < 1 || inactiveCalls.getCompactionSettings < 1) {
+        throw new Error(
+          `S12: real settings reads active=${activeCalls.getCompactionSettings} inactive=${inactiveCalls.getCompactionSettings}`,
+        );
+      }
       if (activeFlags?.speculativeEnabled !== false) throw new Error("S12: active session is not suppressed");
       if (inactiveFlags?.speculativeEnabled !== true) {
         throw new Error(
@@ -1320,8 +1578,14 @@ async function armTwoSessions(worker: Worker): Promise<void> {
       ) {
         throw new Error("S12: inactive session produced UI output");
       }
-      worker.artifacts.s12 = { activeFlags, inactiveFlags, gate };
-      return `active flags false; inactive session stock flags true; no UI output`;
+      worker.artifacts.s12 = {
+        activeFlags,
+        inactiveFlags,
+        gate,
+        activeSettingsReads: activeCalls.getCompactionSettings,
+        inactiveSettingsReads: inactiveCalls.getCompactionSettings,
+      };
+      return `active flags false; inactive session stock flags true; no UI output; realSettingsReads=${activeCalls.getCompactionSettings}/${inactiveCalls.getCompactionSettings}`;
     } finally {
       if (active) await worker.dispose(active);
       if (inactive) await worker.dispose(inactive);
@@ -1395,8 +1659,12 @@ async function armSlots(worker: Worker): Promise<void> {
         throw new Error(`S10: route=${apply.route} site=${apply.site}`);
       }
       if (requests < 2) throw new Error(`S10: only ${requests} /slots requests`);
-      worker.artifacts.s10 = { requests, apply };
-      return `fake /slots: ${requests} GETs, eviction -> cold timer apply`;
+      const calls = worker.realCalls(kit);
+      if (calls.applyCompaction < 1) {
+        throw new Error("S10: the real AgentSession.applyCompaction was never called");
+      }
+      worker.artifacts.s10 = { requests, apply, applyCompactionCalls: calls.applyCompaction };
+      return `fake /slots: ${requests} GETs, eviction -> cold timer apply; realApplyCompaction=${calls.applyCompaction}`;
     } finally {
       globalThis.fetch = originalFetch;
       if (kit) await worker.dispose(kit);
@@ -1417,11 +1685,15 @@ async function openStockSessionFile(worker: Worker, file: string): Promise<void>
       const context = kit.session.sessionManager.buildSessionContext();
       const messages = Array.isArray(context?.messages) ? context.messages : [];
       if (messages.length === 0) throw new Error("S8-open: buildSessionContext returned no messages");
+      const calls = worker.realCalls(kit);
+      if (calls.buildSessionContext < 1) {
+        throw new Error("S8-open: the real SessionManager.buildSessionContext was never called");
+      }
       const text = JSON.stringify(context);
       if (!text.includes("BASE SUMMARY")) throw new Error("S8-open: the notes summary is missing");
       await kit.prompt("Continue the reopened stock session.");
-      worker.artifacts.s8open = { messages: messages.length, sessionFile: file };
-      return `stock session opened the mod session file; buildSessionContext messages=${messages.length}`;
+      worker.artifacts.s8open = { messages: messages.length, sessionFile: file, buildSessionContextCalls: calls.buildSessionContext };
+      return `stock session opened the mod session file; buildSessionContext messages=${messages.length}; realBuildSessionContext=${calls.buildSessionContext}`;
     } finally {
       if (kit) await worker.dispose(kit);
     }
