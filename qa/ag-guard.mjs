@@ -142,6 +142,16 @@ function doCheck() {
     reasons.push("extensions-listing-changed");
   }
 
+  // Every other baseline file drift is REPORTED, never a failure (the owner
+  // keeps using senpi during execution). settings.json has dedicated
+  // guarded-key logic below and is excluded from this generic loop.
+  for (const name of BASELINE_FILES) {
+    if (name === "settings.json") continue;
+    const before = (baseline.files ?? {})[name] ?? null;
+    const after = (now.files ?? {})[name] ?? null;
+    if (before !== after) reported.push(`${name}-changed`);
+  }
+
   const baseKeys = baseline.settingsKeys ?? null;
   const nowKeys = now.settingsKeys ?? null;
   if (JSON.stringify(baseKeys) !== JSON.stringify(nowKeys)) {

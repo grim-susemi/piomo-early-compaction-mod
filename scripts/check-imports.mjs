@@ -2,10 +2,13 @@
 // node:* builtin, or exactly one of the two extension-loader roots.
 // Any deeper path (e.g. "@code-yeongyu/senpi/dist/...") fails.
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SRC = join(fileURLToPath(new URL("..", import.meta.url)), "src");
+// Optional argv[2] lets tests run the guard against a temp fixture tree.
+const SRC = process.argv[2]
+  ? resolve(process.argv[2])
+  : join(fileURLToPath(new URL("..", import.meta.url)), "src");
 
 const ALLOWED_ROOTS = new Set([
   "@code-yeongyu/senpi",
@@ -26,14 +29,40 @@ function stripComments(text) {
 const STATIC_RE =
   /(?:import\s+(?:[^'"]*?\sfrom\s+)?|export\s+[^'"]*?\sfrom\s+)['"]([^'"]+)['"]/g;
 const DYNAMIC_RE = /import\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+const DYNAMIC_TEMPLATE_RE = /import\s*\(\s*`((?:[^`\\]|\\.)*)`\s*\)/g;
 
-function specifiersOf(text) {
+function staticAndQuotedDynamic(clean) {
   const out = [];
-  const clean = stripComments(text);
   for (const re of [STATIC_RE, DYNAMIC_RE]) {
     re.lastIndex = 0;
     let m;
     while ((m = re.exec(clean)) !== null) out.push(m[1]);
+  }
+  return out;
+}
+
+// Template-literal dynamic imports: a substitution-free template is its plain
+// specifier. A template WITH substitutions fails when any literal chunk carries
+// an allowed-root-plus-slash prefix, or when the fixed head before the first
+// ${} is not a relative path, a node: builtin, or exactly an allowed root.
+function checkTemplateBody(body) {
+  const sub = body.indexOf("${");
+  if (sub === -1) return isAllowed(body) ? null : body;
+  for (const root of ALLOWED_ROOTS) {
+    if (body.includes(root + "/")) return body;
+  }
+  const head = body.slice(0, sub);
+  if (head.startsWith(".") || head.startsWith("node:")) return null;
+  if (ALLOWED_ROOTS.has(head)) return null;
+  return body;
+}
+
+function templateViolations(clean) {
+  const out = [];
+  DYNAMIC_TEMPLATE_RE.lastIndex = 0;
+  let m;
+  while ((m = DYNAMIC_TEMPLATE_RE.exec(clean)) !== null) {
+    if (checkTemplateBody(m[1]) !== null) out.push("`" + m[1] + "`");
   }
   return out;
 }
@@ -51,9 +80,11 @@ function walk(dir) {
 const failures = [];
 for (const file of walk(SRC)) {
   const text = readFileSync(file, "utf8");
-  for (const spec of specifiersOf(text)) {
+  const clean = stripComments(text);
+  for (const spec of staticAndQuotedDynamic(clean)) {
     if (!isAllowed(spec)) failures.push({ file, spec });
   }
+  for (const spec of templateViolations(clean)) failures.push({ file, spec });
 }
 
 if (failures.length > 0) {
