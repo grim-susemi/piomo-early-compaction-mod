@@ -15,6 +15,8 @@ import {
   countNotesBlocks,
   generateCompaction,
   notesHeader,
+  outputCap,
+  REWRITE_SUMMARY_CAP_RATIO,
   type GenerateAuth,
   type GenerateCompactionSettings,
   type GenerateCompleteOptions,
@@ -346,6 +348,28 @@ describe("rewrite generation", () => {
       "ORIGINAL_REQUEST: build the mod",
     );
     expect(outcome.result.details?.earlyCompaction.kind).toBe("rewrite-first");
+  });
+});
+
+describe("output cap", () => {
+  test("rewrites allow 2.5x the estimated summary; notes keep 80% of the reserve", () => {
+    expect(REWRITE_SUMMARY_CAP_RATIO).toBe(2.5);
+    expect(outputCap("notes", 16_384, 20_000, 0)).toBe(13_107);
+    // A small summary keeps the reserve cap.
+    expect(outputCap("rewrite-consolidate", 16_384, 4_000, 0)).toBe(13_107);
+    expect(outputCap("rewrite-consolidate", 16_384, 8_726, 0)).toBe(21_815);
+    expect(outputCap("rewrite", 16_384, 10_000, 0)).toBe(25_000);
+  });
+
+  test("the highest measured output ratio (2.38x) stays below the truncation line", () => {
+    const estimated = 10_000;
+    const cap = outputCap("rewrite-consolidate", 16_384, estimated, 0);
+    expect(Math.ceil(2.38 * estimated)).toBeLessThan(0.98 * cap);
+  });
+
+  test("the model's own maxTokens bounds every cap", () => {
+    expect(outputCap("rewrite-consolidate", 16_384, 10_000, 20_000)).toBe(20_000);
+    expect(outputCap("notes", 16_384, 0, 8_000)).toBe(8_000);
   });
 });
 

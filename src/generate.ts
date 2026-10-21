@@ -264,9 +264,16 @@ export function buildNotesPrompt(previousSummary: string | undefined): BuiltProm
 }
 
 /**
+ * Rewrite headroom over the estimated current summary. The estimate counts
+ * `length / 4`; measured consolidations produced 1.18-2.38x (median 1.45x)
+ * that estimate in real output tokens, so 1.5x cut about half of them.
+ */
+export const REWRITE_SUMMARY_CAP_RATIO = 2.5;
+
+/**
  * Output cap: notes reserve 80% of the output budget; rewrites also allow
- * 1.5x the current summary so a consolidation can grow. Both are bounded by
- * the model's own `maxTokens`.
+ * `REWRITE_SUMMARY_CAP_RATIO` times the current summary so a consolidation
+ * can finish. Both are bounded by the model's own `maxTokens`.
  */
 export function outputCap(
   kind: JobKind,
@@ -278,7 +285,7 @@ export function outputCap(
   const raw =
     kind === "notes"
       ? reserveCap
-      : Math.max(reserveCap, Math.ceil(1.5 * previousSummaryTokens));
+      : Math.max(reserveCap, Math.ceil(REWRITE_SUMMARY_CAP_RATIO * previousSummaryTokens));
   const bounded = modelMaxTokens > 0 ? Math.min(raw, modelMaxTokens) : raw;
   return Math.max(1, bounded);
 }

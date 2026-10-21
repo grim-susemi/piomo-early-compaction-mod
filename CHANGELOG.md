@@ -10,6 +10,11 @@
 - The footer shows `EC 재시도중(잘림)` during that retry and
   `EC 실패(잘림|인증|중단|오류)` after a failed job, instead of
   returning to `EC 대기`; `/early-compaction` reports `failed: <reason>`.
+- A summary rewrite may now produce 2.5x the estimated current summary
+  (was 1.5x). The `length / 4` estimate undercounts real output tokens
+  (measured 1.18-2.38x, median 1.45x), so 1.5x cut about a quarter of all
+  consolidations. The 80% reserve floor and the model's `maxTokens` still
+  bound the cap.
 
 ## 0.1.0 - 2026-10-19
 
