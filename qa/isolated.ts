@@ -30,7 +30,9 @@ const OUT_DIR = path.join(REPO, "qa", "out");
 const REPORT_PATH = path.join(OUT_DIR, "isolated-report.json");
 const BROKEN_REPORT_PATH = path.join(OUT_DIR, "isolated-broken-report.json");
 const OMO_SOURCE = "C:/Users/USER/.omo-stable-500/home/.omo/agent/extensions/omo-compaction-model.ts";
-const CM_ROOT = "C:/Users/USER/orca/projects/piomo-agent-coordination-mod";
+// The coordination mod source built for the coexistence arms; point it at the checkout that
+// supports the installed senpi (for example a port worktree before it is merged).
+const CM_ROOT = process.env.PIOMO_QA_CM_ROOT || "C:/Users/USER/orca/projects/piomo-agent-coordination-mod";
 const EVIDENCE_FILE =
   "C:/Users/USER/orca/projects/기타 작업/.omo/evidence/overlay-early-compaction-mod/task-14-overlay-early-compaction-mod.json";
 
@@ -239,6 +241,19 @@ function guardCheck(): { pass: boolean; observable: string; details: Json } {
   };
 }
 
+// The guard compares the live agent dir with its state when this run starts, so an
+// installed mod is not residue; only what this run would add or change fails S9.
+function guardBaseline(): void {
+  const result = spawnSync("node", ["qa/ag-guard.mjs", "baseline"], {
+    cwd: REPO,
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  if (result.status !== 0) {
+    throw new Error(`ag-guard baseline failed (${result.status}): ${result.stdout ?? ""}${result.stderr ?? ""}`);
+  }
+}
+
 function tempAgentDirs(): Set<string> {
   try {
     return new Set(
@@ -290,6 +305,7 @@ function runBroken(root: string): never {
 async function main(): Promise<void> {
   ensureDist();
   if (!fs.existsSync(OMO_SOURCE)) throw new Error(`missing OMO source ${OMO_SOURCE}`);
+  guardBaseline();
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "piomo-isolated-"));
   const beforeAgentDirs = tempAgentDirs();

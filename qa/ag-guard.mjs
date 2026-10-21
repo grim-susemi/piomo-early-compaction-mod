@@ -4,15 +4,22 @@
 //   node qa/ag-guard.mjs baseline   sha256 AG files + extensions listing
 //   node qa/ag-guard.mjs check      exit 0 clean, 1 with named reasons
 //
+// The baseline also records the early-compaction paths that already exist (an installed
+// mod) and the hashes of the installed mod files. `check` then fails on early-compaction
+// paths created after the baseline and on any change to those files, so the guard works
+// both before the first install and when requalifying an installed mod. A baseline
+// written before this record existed keeps the original rule: every such path is residue.
+//
 // Hashes and names only: file contents and values are never copied.
+// PIOMO_AG_GUARD_DIR / PIOMO_AG_GUARD_OUT override the agent dir and the output dir (tests).
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const AG = "C:/Users/USER/.omo-stable-500/home/.omo/agent";
+const AG = process.env.PIOMO_AG_GUARD_DIR || "C:/Users/USER/.omo-stable-500/home/.omo/agent";
 const REPO = join(fileURLToPath(new URL(".", import.meta.url)), "..");
-const OUT_DIR = join(REPO, "qa", "out");
+const OUT_DIR = process.env.PIOMO_AG_GUARD_OUT || join(REPO, "qa", "out");
 const BASELINE_PATH = join(OUT_DIR, "ag-baseline.json");
 
 const BASELINE_FILES = [
@@ -22,6 +29,13 @@ const BASELINE_FILES = [
   "models.yml",
   "models-store.json",
   "credential-pool-state.json",
+];
+
+// Installed mod files that a QA run must never change.
+const MOD_FILES = [
+  "extensions/early-compaction.js",
+  "early-compaction/config.json",
+  "early-compaction/qualified.json",
 ];
 
 function sha256(text) {
@@ -68,6 +82,10 @@ function snapshot() {
     files,
     extensions: sortedListing(join(AG, "extensions")),
     settingsKeys: settingsKeyHashes(),
+    earlyCompaction: {
+      paths: findEarlyCompactionPaths(),
+      files: Object.fromEntries(MOD_FILES.map((name) => [name, fileHash(name)])),
+    },
   };
 }
 
@@ -132,9 +150,18 @@ function doCheck() {
   const baseline = JSON.parse(readFileSync(BASELINE_PATH, "utf8"));
   const now = snapshot();
 
-  const hits = findEarlyCompactionPaths();
+  const installed = baseline.earlyCompaction ?? null;
+  const known = new Set(installed?.paths ?? []);
+  const hits = findEarlyCompactionPaths().filter((p) => !known.has(p));
   if (hits.length > 0) {
     reasons.push(`early-compaction-residue: ${hits.join(", ")}`);
+  }
+  if (installed) {
+    for (const name of MOD_FILES) {
+      if ((installed.files ?? {})[name] !== now.earlyCompaction.files[name]) {
+        reasons.push(`early-compaction-changed: ${name}`);
+      }
+    }
   }
 
   const baseExt = baseline.extensions ?? null;
