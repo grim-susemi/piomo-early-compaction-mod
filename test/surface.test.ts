@@ -131,16 +131,45 @@ describe("footer", () => {
     const states: SurfaceState[] = [
       { phase: "idle" },
       { phase: "generating" },
+      { phase: "retrying" },
       { phase: "ready", savedTokens: 61_500 },
+      { phase: "failed", reason: "truncated" },
+      { phase: "failed", reason: "auth" },
+      { phase: "failed", reason: "aborted" },
+      { phase: "failed", reason: "failed" },
     ];
     expect(states.map(footerText)).toEqual([
       "EC 대기",
       "EC 준비중",
+      "EC 재시도중(잘림)",
       "EC 준비됨 -62k",
+      "EC 실패(잘림)",
+      "EC 실패(인증)",
+      "EC 실패(중단)",
+      "EC 실패(오류)",
     ]);
     expect(thousands(-10)).toBe(0);
     expect(thousands(61_499)).toBe(61);
     expect(dormantFooterText("capability")).toBe("EC 꺼짐(capability)");
+  });
+
+  test("a failure stays on the footer and in the status text until the next state", () => {
+    const { ui, surface } = activeSurface();
+
+    surface.setState({ phase: "generating" });
+    surface.setState({ phase: "retrying" });
+    surface.setState({ phase: "failed", reason: "truncated" });
+    expect(surface.statusText()).toContain("state: active (failed: truncated)");
+    expect(surface.snapshot().state).toEqual({ phase: "failed", reason: "truncated" });
+
+    surface.setState({ phase: "generating" });
+    expect(statusTexts(ui)).toEqual([
+      "EC 대기",
+      "EC 준비중",
+      "EC 재시도중(잘림)",
+      "EC 실패(잘림)",
+      "EC 준비중",
+    ]);
   });
 
   test("stop clears the footer once", () => {

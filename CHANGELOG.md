@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- A summary rewrite (consolidation or `mode rewrite`) that is cut at its output
+  cap retries once in the same slot as a notes append instead of ending the
+  job; the cut attempt no longer counts toward the failure breaker. While the
+  previous summary stays at least as large as the one that was cut, later jobs
+  append notes directly.
+- The footer shows `EC 재시도중(잘림)` during that retry and
+  `EC 실패(잘림|인증|중단|오류)` after a failed job, instead of
+  returning to `EC 대기`; `/early-compaction` reports `failed: <reason>`.
+
 ## 0.1.0 - 2026-10-19
 
 - Early compaction summaries prepared in the background and applied only at

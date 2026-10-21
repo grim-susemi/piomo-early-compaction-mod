@@ -21,6 +21,7 @@ import type { MetricsEventName, MetricsFieldsFor } from "../src/metrics";
 import type { ActivateResult, InstallOverrideResult } from "../src/override";
 import { DEFAULTS, type CacheState, type PolicyConfig } from "../src/policy";
 import type { PrepareSourceInput, PreparedSource } from "../src/prepare";
+import { STATUS_KEY } from "../src/surface";
 
 const TIMESTAMP = new Date(0).toISOString();
 const SYSTEM_PROMPT = "system prompt";
@@ -618,6 +619,14 @@ function lastApply(h: Harness): Record<string, unknown> | undefined {
   return h.metrics.find("apply").at(-1)?.fields;
 }
 
+function footerTexts(h: Harness): (string | undefined)[] {
+  return h.ctx.ui.status.filter((call) => call.key === STATUS_KEY).map((call) => call.text);
+}
+
+function generatedKinds(h: Harness): string[] {
+  return h.generateCalls.map((call) => call.kind);
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time contract: the real ExtensionContext fits the handlers' type.
 // ---------------------------------------------------------------------------
@@ -753,24 +762,35 @@ describe("job state machine", () => {
       outcomeName: string;
       reason: string;
       failures: number;
+      footer: string;
     }> = [
       {
         outcome: { status: "failed", reason: "auth" },
         outcomeName: "failed",
         reason: "auth",
         failures: 1,
+        footer: "EC 실패(인증)",
       },
       {
         outcome: { status: "skipped", reason: "model-unresolved" },
         outcomeName: "skipped",
         reason: "model-unresolved",
         failures: 0,
+        footer: "EC 대기",
       },
       {
         outcome: { status: "aborted" },
         outcomeName: "aborted",
         reason: "aborted",
         failures: 1,
+        footer: "EC 실패(중단)",
+      },
+      {
+        outcome: { status: "failed", reason: "empty" },
+        outcomeName: "failed",
+        reason: "failed",
+        failures: 1,
+        footer: "EC 실패(오류)",
       },
     ];
 
@@ -784,6 +804,7 @@ describe("job state machine", () => {
       const jobEnd = h.metrics.find("job_end").at(-1);
       expect(jobEnd?.fields.outcome).toBe(testCase.outcomeName);
       expect(jobEnd?.fields.reason).toBe(testCase.reason);
+      expect(footerTexts(h).at(-1)).toBe(testCase.footer);
       if (testCase.outcomeName === "skipped") {
         expect(
           h.ctx.ui.notices.some((notice) =>
@@ -792,6 +813,96 @@ describe("job state machine", () => {
         ).toBe(true);
       }
     }
+  });
+
+  test("a truncated summary rewrite retries once as notes in the same slot, then holds rewrites off", async () => {
+    let previousSummary = "PREVIOUS SUMMARY";
+    const h = await makeHarness({
+      policy: { consolidateSummaryTokens: 1 },
+      prepare: () => ({ ...preparedSource(), previousSummary }),
+      generate: async (input) =>
+        input.kind === "rewrite-consolidate"
+          ? { status: "failed", reason: "truncated" }
+          : okOutcome(),
+    });
+
+    await h.pi.emit("turn_end", { type: "turn_end" }, h.ctx);
+    await flush();
+    await flush();
+
+    expect(generatedKinds(h)).toEqual(["rewrite-consolidate", "notes"]);
+    expect(h.generateCalls[1].source).toBe(h.generateCalls[0].source);
+    expect(h.handle.getSession()?.phase).toBe("READY");
+    expect(h.handle.getSession()?.consecutiveFailures).toBe(0);
+    expect(h.metrics.find("job_start").map((entry) => entry.fields.kind)).toEqual([
+      "rewrite-consolidate",
+      "notes",
+    ]);
+    expect(
+      h.metrics.find("job_end").map((entry) => `${entry.fields.outcome}/${entry.fields.reason}`),
+    ).toEqual(["failed/truncated", "ready/ok"]);
+    expect(footerTexts(h).slice(-3)).toEqual([
+      "EC 준비중",
+      "EC 재시도중(잘림)",
+      "EC 준비됨 -30k",
+    ]);
+
+    // Same-sized summary: the known-truncating rewrite is skipped.
+    h.cache.stateValue = "cold";
+    await settle(h);
+    expect(h.ctx.applyCalls).toHaveLength(1);
+    h.ctx.usage.tokens = 80_000;
+    await h.pi.emit("turn_end", { type: "turn_end" }, h.ctx);
+    await flush();
+    expect(generatedKinds(h)).toEqual(["rewrite-consolidate", "notes", "notes"]);
+
+    // A builtin compaction replaces the summary with a smaller one: rewrites may run again.
+    await h.pi.emit(
+      "session_before_compact",
+      { type: "session_before_compact", reason: "threshold" },
+      h.ctx,
+    );
+    expect(h.handle.getSession()?.phase).toBe("EMPTY");
+    h.advance(61_000);
+    previousSummary = "S";
+    h.ctx.usage.tokens = 95_000;
+    await h.pi.emit("turn_end", { type: "turn_end" }, h.ctx);
+    await flush();
+    await flush();
+    expect(generatedKinds(h)).toEqual([
+      "rewrite-consolidate",
+      "notes",
+      "notes",
+      "rewrite-consolidate",
+      "notes",
+    ]);
+  });
+
+  test("a failed notes fallback counts one failure; a first rewrite never falls back", async () => {
+    const fallback = await makeHarness({
+      policy: { consolidateSummaryTokens: 1 },
+      prepare: () => ({ ...preparedSource(), previousSummary: "PREVIOUS SUMMARY" }),
+      generate: async () => ({ status: "failed", reason: "truncated" }),
+    });
+    await fallback.pi.emit("turn_end", { type: "turn_end" }, fallback.ctx);
+    await flush();
+    await flush();
+
+    expect(generatedKinds(fallback)).toEqual(["rewrite-consolidate", "notes"]);
+    expect(fallback.handle.getSession()?.phase).toBe("EMPTY");
+    expect(fallback.handle.getSession()?.consecutiveFailures).toBe(1);
+    expect(footerTexts(fallback).at(-1)).toBe("EC 실패(잘림)");
+
+    const first = await makeHarness({
+      generate: async () => ({ status: "failed", reason: "truncated" }),
+    });
+    await first.pi.emit("turn_end", { type: "turn_end" }, first.ctx);
+    await flush();
+    await flush();
+
+    expect(generatedKinds(first)).toEqual(["rewrite-first"]);
+    expect(first.handle.getSession()?.consecutiveFailures).toBe(1);
+    expect(footerTexts(first).at(-1)).toBe("EC 실패(잘림)");
   });
 
   test("start jitter delays the generation and the delayed start is re-checked", async () => {

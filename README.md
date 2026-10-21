@@ -81,6 +81,10 @@ node scripts/mod.mjs remove --agent-dir <absolute path> --purge-logs
   files`, and `Current next steps`. Every block says that later notes supersede
   earlier Remaining Tasks / Exact Next Steps. A consolidation rewrites the whole
   summary when the running summary reaches 8,192 tokens or four notes blocks.
+  When a rewrite of an existing summary is cut at its output cap, the same slot
+  retries once as a notes append (the cut attempt is not counted as a failure),
+  and while the summary stays at least that large later jobs append notes
+  instead of rewriting again.
 - `rewrite`: every summary is a full rewrite, the same representation stock
   uses.
 
@@ -127,7 +131,9 @@ active.
 ## Visible surface
 
 While active in an interactive session the footer shows `EC 대기`,
-`EC 준비중`, or `EC 준비됨 -<N>k`. Each successful apply emits one notice:
+`EC 준비중`, `EC 재시도중(잘림)`, `EC 준비됨 -<N>k`, or `EC 실패(<사유>)`
+(`잘림`, `인증`, `중단` or `오류`; it stays until the next start, discard or
+apply). Each successful apply emits one notice:
 `조기 요약 적용: <before>k -> <after>k (식은 캐시|작업 끝|한계 도달)`.
 `/early-compaction` prints the current state, mode, applies by route, the last
 apply, and the dormant reason. Warnings appear only for warning dormancy

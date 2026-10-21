@@ -68,7 +68,7 @@ import {
   type PrepareSourceInput,
   type PreparedSource,
 } from "./prepare";
-import type { VisibleSurface } from "./surface";
+import type { SurfaceFailureReason, VisibleSurface } from "./surface";
 
 /** The four observable phases; APPLYING is entered synchronously. */
 export type JobPhase = "EMPTY" | "GENERATING" | "READY" | "APPLYING";
@@ -250,6 +250,11 @@ interface PendingStart {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Job kinds that rewrite an existing summary instead of appending notes. */
+function rewritesPreviousSummary(kind: JobKind): boolean {
+  return kind === "rewrite-consolidate" || kind === "rewrite";
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -442,6 +447,13 @@ export class JobController {
   #keepAliveEnabled = false;
   #lastCacheWarmEntryId: string | null = null;
   #jobSeq = 0;
+  /**
+   * Estimated tokens of the previous summary whose rewrite ran out of output
+   * budget. While the previous summary is at least this large, a rewrite would
+   * be cut again, so the next job appends notes instead. A smaller summary
+   * (for example after a builtin compaction) allows rewrites again.
+   */
+  #rewriteHoldoffTokens: number | null = null;
 
   constructor(options: JobControllerOptions) {
     this.#gate = options.gate;
@@ -848,13 +860,20 @@ export class JobController {
       const cutIndex = branch.findIndex((entry) => entry.id === source.firstKeptEntryId);
       if (cutIndex < 0) return;
 
-      const kind = nextJobKind({
+      const previousSummaryTokens = summaryTokens(source.previousSummary ?? "");
+      const chosenKind = nextJobKind({
         hasCompactionEntry: source.previousSummary !== undefined,
         mode: this.#config.mode,
-        summaryTokens: summaryTokens(source.previousSummary ?? ""),
+        summaryTokens: previousSummaryTokens,
         notesBlocks: countNotesBlocks(source.previousSummary),
         config: this.#config.policy,
       });
+      const kind: JobKind =
+        rewritesPreviousSummary(chosenKind) &&
+        this.#rewriteHoldoffTokens !== null &&
+        previousSummaryTokens >= this.#rewriteHoldoffTokens
+          ? "notes"
+          : chosenKind;
 
       const job: JobRecord = {
         id: `ec-${this.#now().toString(36)}-${++this.#jobSeq}`,
@@ -964,7 +983,7 @@ export class JobController {
         inputTokens: 0,
         outputTokens: 0,
       });
-      this.#clearJob(job);
+      this.#clearJob(job, "aborted");
       this.#noteFailure();
       return;
     }
@@ -983,8 +1002,54 @@ export class JobController {
       inputTokens: 0,
       outputTokens: 0,
     });
-    this.#clearJob(job);
+    if (
+      reason === "truncated" &&
+      rewritesPreviousSummary(job.kind) &&
+      job.source.previousSummary !== undefined
+    ) {
+      this.#rewriteHoldoffTokens = summaryTokens(job.source.previousSummary);
+      // The truncated rewrite is not counted as a failure: the same slot
+      // retries once as a notes append, which has a much smaller output.
+      if (this.#startNotesFallback(job, token)) return;
+    }
+    this.#clearJob(job, reason);
     this.#noteFailure();
+  }
+
+  /**
+   * Replace a truncated rewrite with one notes append over the same source.
+   * Returns false when usage is unreadable; the caller then records the
+   * failure as usual.
+   */
+  #startNotesFallback(failed: JobRecord, token: number): boolean {
+    const usage = this.#observeUsage();
+    if (!usage || usage.tokens === null || usage.window <= 0) return false;
+
+    const job: JobRecord = {
+      id: `ec-${this.#now().toString(36)}-${++this.#jobSeq}`,
+      kind: "notes",
+      startedAt: this.#now(),
+      source: failed.source,
+      anchor: failed.anchor,
+      fingerprint: failed.fingerprint,
+      branchTailId: failed.branchTailId,
+      controller: new AbortController(),
+    };
+    this.#job = job;
+    this.#startTimes.push(this.#now());
+    this.#emit("job_start", {
+      jobId: job.id,
+      kind: job.kind,
+      U: usage.tokens,
+      W: usage.window,
+    });
+    this.#safeSurface(() => this.#surface.setState({ phase: "retrying" }));
+
+    void this.#runGeneration(job, token).catch(() => {
+      if (this.#isLive(token) && this.#job === job) this.#discard("stale");
+      this.#recordInternalError("generation");
+    });
+    return true;
   }
 
   // -------------------------------------------------------------------------
@@ -1250,11 +1315,15 @@ export class JobController {
     if (options.accountFailure !== false) this.#noteFailure();
   }
 
-  #clearJob(job: JobRecord): void {
+  #clearJob(job: JobRecord, failure?: SurfaceFailureReason): void {
     if (this.#job !== job) return;
     this.#job = undefined;
     this.#phase = "EMPTY";
-    this.#surfaceIdle();
+    if (failure === undefined) {
+      this.#surfaceIdle();
+    } else {
+      this.#surfaceFailed(failure);
+    }
   }
 
   #cancelPendingStart(): void {
@@ -1438,6 +1507,11 @@ export class JobController {
   #surfaceIdle(): void {
     if (!this.#active || this.#retired) return;
     this.#safeSurface(() => this.#surface.setState({ phase: "idle" }));
+  }
+
+  #surfaceFailed(reason: SurfaceFailureReason): void {
+    if (!this.#active || this.#retired) return;
+    this.#safeSurface(() => this.#surface.setState({ phase: "failed", reason }));
   }
 
   #safeSurface(action: () => void): void {

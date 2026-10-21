@@ -11,7 +11,11 @@
  * Footer strings:
  *   EC 대기              active, no prepared summary
  *   EC 준비중            a summary is being generated
+ *   EC 재시도중(잘림)    a summary rewrite ran out of output budget and the
+ *                        lighter notes append runs in the same slot
  *   EC 준비됨 -<N>k      READY, N = saved tokens in thousands
+ *   EC 실패(<사유>)      the last job failed (잘림/인증/중단/오류); stays
+ *                        until the next start, discard or apply
  *   EC 꺼짐(<reason>)    warning dormancy only
  *
  * Every apply produces exactly one info notice; skipped jobs and failed jobs
@@ -55,11 +59,24 @@ export const ROUTE_WORDS = {
   threshold: "한계 도달",
 } as const satisfies Record<AppliedRoute, string>;
 
-/** One of the three footer states while the gate is active. */
+/** Why the last job failed, as shown in the footer. */
+export type SurfaceFailureReason = "truncated" | "auth" | "aborted" | "failed";
+
+/** Korean words used in the failure footer. */
+export const FAILURE_WORDS = {
+  truncated: "잘림",
+  auth: "인증",
+  aborted: "중단",
+  failed: "오류",
+} as const satisfies Record<SurfaceFailureReason, string>;
+
+/** One of the footer states while the gate is active. */
 export type SurfaceState =
   | { readonly phase: "idle" }
   | { readonly phase: "generating" }
-  | { readonly phase: "ready"; readonly savedTokens: number };
+  | { readonly phase: "retrying" }
+  | { readonly phase: "ready"; readonly savedTokens: number }
+  | { readonly phase: "failed"; readonly reason: SurfaceFailureReason };
 
 /** Input for one successful apply. */
 export interface SurfaceApply {
@@ -189,8 +206,12 @@ export function footerText(state: SurfaceState): string {
       return "EC 대기";
     case "generating":
       return "EC 준비중";
+    case "retrying":
+      return "EC 재시도중(잘림)";
     case "ready":
       return `EC 준비됨 -${thousands(state.savedTokens)}k`;
+    case "failed":
+      return `EC 실패(${FAILURE_WORDS[state.reason]})`;
   }
 }
 
@@ -212,9 +233,14 @@ function isWarningDormancy(reason: GateReason): reason is WarningDormancyReason 
 }
 
 function copyState(state: SurfaceState): SurfaceState {
-  return state.phase === "ready"
-    ? { phase: "ready", savedTokens: state.savedTokens }
-    : { phase: state.phase };
+  switch (state.phase) {
+    case "ready":
+      return { phase: "ready", savedTokens: state.savedTokens };
+    case "failed":
+      return { phase: "failed", reason: state.reason };
+    default:
+      return { phase: state.phase };
+  }
 }
 
 /**
@@ -305,7 +331,9 @@ export function createSurface(options: SurfaceOptions): VisibleSurface {
         gate.state === "active"
           ? state.phase === "ready"
             ? `state: active (ready, ${thousands(state.savedTokens)}k saved)`
-            : `state: active (${state.phase})`
+            : state.phase === "failed"
+              ? `state: active (failed: ${state.reason})`
+              : `state: active (${state.phase})`
           : `state: dormant (${gate.reason})`;
       const lastApplyLine =
         lastApply === undefined
